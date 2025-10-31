@@ -14,7 +14,7 @@
 namespace torch {
 namespace comms {
 
-xcclResult_t XCCLException::getResult() const {
+onecclResult_t XCCLException::getResult() const {
   return result_;
 }
 
@@ -24,7 +24,7 @@ TorchCommXCCL::TorchCommXCCL()
       init_state_(InitializationState::UNINITIALIZED),
       shutdown_(false) {}
 
-TorchCommXCCL::TorchCommXCCL(const xcclComm_t xccl_comm)
+TorchCommXCCL::TorchCommXCCL(const onecclComm_t xccl_comm)
     : xccl_comm_(xccl_comm),
       device_(at::kXPU),
       init_state_(InitializationState::UNINITIALIZED),
@@ -115,15 +115,11 @@ void TorchCommXCCL::init(
   }
 
   // Create internal stream
-  //
-  // Default priority is 0 as per NVIDIA docs (https://fburl.com/2xb0iqwl).
   int stream_priority = 0;
 
   // Check for high priority stream hint
   if (high_priority_stream_) {
-    int leastPriority, greatestPriority;
-    xpu_api_->getStreamPriorityRange(&leastPriority, &greatestPriority);
-    stream_priority = greatestPriority;
+    stream_priority = -1;
   }
 
   XPU_CHECK(
@@ -162,16 +158,16 @@ void TorchCommXCCL::init(
     options_.store.reset();
   }
 
-  xcclResult_t xcclErr;
+  onecclResult_t xcclErr;
   xcclErr = xccl_api_->commUserRank(xccl_comm_, &rank_);
-  if (xcclErr != xcclSuccess) {
+  if (xcclErr != onecclSuccess) {
     throw std::runtime_error("XCCL User Rank failed");
   }
 
   tryTorchCommLoggingInit("torchcomm");
 
   xcclErr = xccl_api_->commCount(xccl_comm_, &comm_size_);
-  if (xcclErr != xcclSuccess) {
+  if (xcclErr != onecclSuccess) {
     throw std::runtime_error("XCCL Count failed");
   }
 
@@ -223,7 +219,7 @@ void TorchCommXCCL::finalize() {
     throw std::runtime_error("Work timed out during finalize");
   } else if (work_status == TorchWorkXCCL::WorkStatus::ERROR) {
     comm_state_ = CommState::ERROR;
-    xcclResult_t asyncErr;
+    onecclResult_t asyncErr;
     xccl_api_->commGetAsyncError(xccl_comm_, &asyncErr);
     XCCLException xcclException(*xccl_api_, "XCCL Async Error", asyncErr);
     abortXcclComm();
@@ -294,8 +290,8 @@ int TorchCommXCCL::getRank() const {
   checkInitialized();
 
   int rank;
-  xcclResult_t xcclErr = xccl_api_->commUserRank(xccl_comm_, &rank);
-  if (xcclErr != xcclSuccess) {
+  onecclResult_t xcclErr = xccl_api_->commUserRank(xccl_comm_, &rank);
+  if (xcclErr != onecclSuccess) {
     throw XCCLException(*xccl_api_, "XCCL User Rank failed", xcclErr);
   }
   return rank;
@@ -305,8 +301,8 @@ int TorchCommXCCL::getSize() const {
   checkInitialized();
 
   int comm_size;
-  xcclResult_t xcclErr = xccl_api_->commCount(xccl_comm_, &comm_size);
-  if (xcclErr != xcclSuccess) {
+  onecclResult_t xcclErr = xccl_api_->commCount(xccl_comm_, &comm_size);
+  if (xcclErr != onecclSuccess) {
     throw XCCLException(*xccl_api_, "XCCL Count failed", xcclErr);
   }
   return comm_size;
@@ -349,7 +345,7 @@ std::shared_ptr<TorchWork> TorchCommXCCL::send(
   // Record start event before XCCL operation
   work->recordStart();
 
-  xcclResult_t result = xccl_api_->send(
+  onecclResult_t result = xccl_api_->send(
       tensor.data_ptr(),
       tensor.numel(),
       getXcclDataType(tensor),
@@ -357,7 +353,7 @@ std::shared_ptr<TorchWork> TorchCommXCCL::send(
       xccl_comm_,
       stream);
 
-  if (result != xcclSuccess) {
+  if (result != onecclSuccess) {
     throw XCCLException(*xccl_api_, "XCCL Send failed", result);
   }
 
@@ -388,7 +384,7 @@ std::shared_ptr<TorchWork> TorchCommXCCL::recv(
   // Record start event before XCCL operation
   work->recordStart();
 
-  xcclResult_t result = xccl_api_->recv(
+  onecclResult_t result = xccl_api_->recv(
       tensor.data_ptr(),
       tensor.numel(),
       getXcclDataType(tensor),
@@ -396,7 +392,7 @@ std::shared_ptr<TorchWork> TorchCommXCCL::recv(
       xccl_comm_,
       stream);
 
-  if (result != xcclSuccess) {
+  if (result != onecclSuccess) {
     throw XCCLException(*xccl_api_, "XCCL Recv failed", result);
   }
 
@@ -452,8 +448,8 @@ std::shared_ptr<TorchWork> TorchCommXCCL::batch_op_issue(
   work->recordStart();
 
   // Start XCCL group for batched operations
-  xcclResult_t result = xccl_api_->groupStart();
-  if (result != xcclSuccess) {
+  onecclResult_t result = xccl_api_->groupStart();
+  if (result != onecclSuccess) {
     throw XCCLException(*xccl_api_, "XCCL GroupStart failed", result);
   }
 
@@ -468,7 +464,7 @@ std::shared_ptr<TorchWork> TorchCommXCCL::batch_op_issue(
           xccl_comm_,
           stream);
 
-      if (result != xcclSuccess) {
+      if (result != onecclSuccess) {
         xccl_api_->groupEnd(); // Clean up group on error
         throw XCCLException(
             *xccl_api_, "XCCL Send failed in batch operation", result);
@@ -482,7 +478,7 @@ std::shared_ptr<TorchWork> TorchCommXCCL::batch_op_issue(
           xccl_comm_,
           stream);
 
-      if (result != xcclSuccess) {
+      if (result != onecclSuccess) {
         xccl_api_->groupEnd(); // Clean up group on error
         throw XCCLException(
             *xccl_api_, "XCCL Recv failed in batch operation", result);
@@ -492,7 +488,7 @@ std::shared_ptr<TorchWork> TorchCommXCCL::batch_op_issue(
 
   // End XCCL group
   result = xccl_api_->groupEnd();
-  if (result != xcclSuccess) {
+  if (result != onecclSuccess) {
     throw XCCLException(*xccl_api_, "XCCL GroupEnd failed", result);
   }
 
@@ -525,7 +521,7 @@ std::shared_ptr<TorchWork> TorchCommXCCL::broadcast(
   // Record start event before XCCL operation
   work->recordStart();
 
-  xcclResult_t result = xccl_api_->bcast(
+  onecclResult_t result = xccl_api_->bcast(
       tensor.data_ptr(),
       tensor.numel(),
       getXcclDataType(tensor),
@@ -533,7 +529,7 @@ std::shared_ptr<TorchWork> TorchCommXCCL::broadcast(
       xccl_comm_,
       stream);
 
-  if (result != xcclSuccess) {
+  if (result != onecclSuccess) {
     throw XCCLException(*xccl_api_, "XCCL Broadcast failed", result);
   }
 
@@ -565,7 +561,7 @@ std::shared_ptr<TorchWork> TorchCommXCCL::all_reduce(
   work->recordStart();
 
   const auto dataType = getXcclDataType(tensor);
-  xcclResult_t result = xccl_api_->allReduce(
+  onecclResult_t result = xccl_api_->allReduce(
       tensor.data_ptr(),
       tensor.data_ptr(), // In-place operation
       tensor.numel(),
@@ -574,7 +570,7 @@ std::shared_ptr<TorchWork> TorchCommXCCL::all_reduce(
       xccl_comm_,
       stream);
 
-  if (result != xcclSuccess) {
+  if (result != onecclSuccess) {
     throw XCCLException(*xccl_api_, "XCCL AllReduce failed", result);
   }
 
@@ -611,7 +607,7 @@ std::shared_ptr<TorchWork> TorchCommXCCL::reduce(
   work->recordStart();
 
   const auto dataType = getXcclDataType(tensor);
-  xcclResult_t result = xccl_api_->reduce(
+  onecclResult_t result = xccl_api_->reduce(
       tensor.data_ptr(),
       rank_ == root ? tensor.data_ptr() : nullptr,
       tensor.numel(),
@@ -621,7 +617,7 @@ std::shared_ptr<TorchWork> TorchCommXCCL::reduce(
       xccl_comm_,
       stream);
 
-  if (result != xcclSuccess) {
+  if (result != onecclSuccess) {
     throw XCCLException(*xccl_api_, "XCCL Reduce failed", result);
   }
 
@@ -715,7 +711,7 @@ std::shared_ptr<TorchWork> TorchCommXCCL::all_gather_single(
 
   work->recordStart();
 
-  xcclResult_t result = xccl_api_->allGather(
+  onecclResult_t result = xccl_api_->allGather(
       input.data_ptr(),
       output.data_ptr(),
       input.numel(),
@@ -723,7 +719,7 @@ std::shared_ptr<TorchWork> TorchCommXCCL::all_gather_single(
       xccl_comm_,
       stream);
 
-  if (result != xcclSuccess) {
+  if (result != onecclSuccess) {
     throw XCCLException(*xccl_api_, "XCCL AllGather failed", result);
   }
 
@@ -837,7 +833,7 @@ std::shared_ptr<TorchWork> TorchCommXCCL::reduce_scatter_single(
   work->recordStart();
 
   const auto dataType = getXcclDataType(input);
-  xcclResult_t result = xccl_api_->reduceScatter(
+  onecclResult_t result = xccl_api_->reduceScatter(
       input.data_ptr(),
       output.data_ptr(),
       output.numel(),
@@ -846,7 +842,7 @@ std::shared_ptr<TorchWork> TorchCommXCCL::reduce_scatter_single(
       xccl_comm_,
       stream);
 
-  if (result != xcclSuccess) {
+  if (result != onecclSuccess) {
     throw XCCLException(*xccl_api_, "XCCL ReduceScatter failed", result);
   }
 
@@ -893,14 +889,14 @@ std::shared_ptr<TorchWork> TorchCommXCCL::all_to_all_single(
   const auto data_type = getXcclDataType(input);
 
 #if XCCL_VERSION_CODE >= XCCL_VERSION(2, 28, 0)
-  xcclResult_t result = xccl_api_->allToAll(
+  onecclResult_t result = xccl_api_->allToAll(
       input.data_ptr(),
       output.data_ptr(),
       chunk_size,
       data_type,
       xccl_comm_,
       stream);
-  if (result != xcclSuccess) {
+  if (result != onecclSuccess) {
     throw XCCLException(*xccl_api_, "XCCL AllToAll failed", result);
   }
 #else
@@ -1100,7 +1096,7 @@ std::shared_ptr<TorchWork> TorchCommXCCL::barrier(
   work->recordStart();
 
   // Use pre-allocated XPU buffer for barrier
-  xcclResult_t result = xccl_api_->allReduce(
+  onecclResult_t result = xccl_api_->allReduce(
       barrier_buffer_,
       barrier_buffer_,
       1,
@@ -1109,7 +1105,7 @@ std::shared_ptr<TorchWork> TorchCommXCCL::barrier(
       xccl_comm_,
       stream);
 
-  if (result != xcclSuccess) {
+  if (result != onecclSuccess) {
     throw XCCLException(*xccl_api_, "XCCL Barrier failed", result);
   }
 
@@ -1347,7 +1343,7 @@ std::shared_ptr<TorchCommBackend> TorchCommXCCL::split(
   }
 
   // Create a new XCCL communicator
-  xcclComm_t new_comm;
+  onecclComm_t new_comm;
   xcclConfig_t config = XCCL_CONFIG_INITIALIZER;
 #if XCCL_VERSION_CODE >= XCCL_VERSION(2, 27, 0)
   config.commName = strdup(name.c_str());
@@ -1361,9 +1357,9 @@ std::shared_ptr<TorchCommBackend> TorchCommXCCL::split(
   // TODO: what happens if one rank fails but the others succeed, need to
   // handle the error case.
   // TODO: is this sharing any resources with the original comm?
-  xcclResult_t result =
+  onecclResult_t result =
       xccl_api_->commSplit(xccl_comm_, color, new_rank, &new_comm, &config);
-  if (result != xcclSuccess) {
+  if (result != onecclSuccess) {
     throw XCCLException(*xccl_api_, "XCCL split failed", result);
   }
   if (new_rank == -1) {
@@ -1390,9 +1386,9 @@ void TorchCommXCCL::register_address(
     throw std::runtime_error("Memory already registered with XCCL");
   }
   void* handle = nullptr;
-  xcclResult_t result =
+  onecclResult_t result =
       xccl_api_->commRegister(xccl_comm_, addr.addr, addr.len, &handle);
-  if (result != xcclSuccess) {
+  if (result != onecclSuccess) {
     throw std::runtime_error(
         "Failed to register memory with XCCL: " +
         std::string(xcclGetErrorString(result)));
@@ -1414,8 +1410,8 @@ void TorchCommXCCL::deregister_address(const TorchCommXCCL::Address& addr) {
   }
 
   void* handle = it->second.regHandle;
-  xcclResult_t result = xccl_api_->commDeregister(xccl_comm_, handle);
-  if (result != xcclSuccess) {
+  onecclResult_t result = xccl_api_->commDeregister(xccl_comm_, handle);
+  if (result != onecclSuccess) {
     throw std::runtime_error(
         "Failed to deregister memory with XCCL: " +
         std::string(xccl_api_->getErrorString(result)));
@@ -1427,7 +1423,7 @@ void TorchCommXCCL::deregister_address(const TorchCommXCCL::Address& addr) {
 XCCLException::XCCLException(
     XcclApi& xccl_api,
     const std::string& message,
-    xcclResult_t result)
+    onecclResult_t result)
     : message_(message + ": " + xccl_api.getErrorString(result)),
       result_(result) {}
 
