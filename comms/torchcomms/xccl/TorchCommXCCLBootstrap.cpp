@@ -7,7 +7,6 @@
 #include "comms/torchcomms/TorchCommLogging.hpp"
 #include "comms/torchcomms/TorchCommUtils.hpp"
 #include "comms/torchcomms/xccl/TorchCommXCCL.hpp"
-#include "xccl.h" // @manual
 
 namespace torch {
 namespace comms {
@@ -226,7 +225,6 @@ void populateXcclConfigFromHints(
       TC_LOG(INFO) << "[comm=" << name
                    << "] Setting config.splitShare=" << config.splitShare;
     }
-#if XCCL_VERSION_CODE >= XCCL_VERSION(2, 27, 0)
     else if (key == "trafficClass" || key == "traffic_class") {
       config.trafficClass = std::stoi(val);
       TC_LOG(INFO) << "[comm=" << name
@@ -252,7 +250,6 @@ void populateXcclConfigFromHints(
       TC_LOG(INFO) << "[comm=" << name
                    << "] Setting config.nvlsCTAs=" << config.nvlsCTAs;
     }
-#elif XCCL_VERSION_CODE >= XCCL_VERSION(2, 28, 0)
     else if (key == "nChannelsPerNetPeer" || key == "n_channels_per_net_peer") {
       config.nChannelsPerNetPeer = std::stoi(val);
       TC_LOG(INFO) << "[comm=" << name
@@ -263,7 +260,6 @@ void populateXcclConfigFromHints(
       TC_LOG(INFO) << "[comm=" << name << "] Setting config.nvlinkCentricSched="
                    << config.nvlinkCentricSched;
     }
-#endif
     else {
       TC_LOG(WARNING)
           << "XCCL hint '" << key
@@ -285,9 +281,7 @@ onecclComm_t TorchCommXCCLBootstrap::createXcclComm(
   // TODO: use scalable init
   // TODO: get the local rank
   onecclConfig_t config = XCCL_CONFIG_INITIALIZER;
-#if XCCL_VERSION_CODE >= XCCL_VERSION(2, 27, 0)
   config.commName = strdup(name.c_str());
-#endif
 
   // Populate XCCL config from user-provided hints
   populateXcclConfigFromHints(config, options, name);

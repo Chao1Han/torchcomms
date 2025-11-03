@@ -1,12 +1,13 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 
 #include "comms/torchcomms/xccl/TorchCommXCCL.hpp"
-#include "comms/torchcomms/xccl/TorchCommXCCLCCA.hpp"
+// #include "comms/torchcomms/xccl/TorchCommXCCLCCA.hpp"
 
 #include <stdexcept>
 #include <string>
 #include "comms/torchcomms/TorchCommLogging.hpp"
-#include "xccl.h" // @manual
+#include <oneapi/ccl.h>
+#include <oneapi/ccl.hpp>
 
 namespace torch {
 namespace comms {

@@ -124,16 +124,16 @@ void TorchCommXCCL::init(
 
   XPU_CHECK(
       xpu_api_,
-      xpu_api_->streamCreateWithPriority(
-          &internal_stream_, xpuStreamNonBlocking, stream_priority),
+    xpu_api_->streamCreateWithPriority(
+      &internal_stream_, /*flags=*/0, stream_priority),
       "Failed to create internal XPU stream on device " +
           std::to_string(device_.index()));
 
   // Create dependency event for stream synchronization
   XPU_CHECK(
       xpu_api_,
-      xpu_api_->eventCreateWithFlags(
-          &dependency_event_, xpuEventDisableTiming),
+    xpu_api_->eventCreateWithFlags(
+      &dependency_event_, /*flags=*/0),
       "Failed to create dependency event on device " +
           std::to_string(device_.index()));
 
@@ -888,7 +888,6 @@ std::shared_ptr<TorchWork> TorchCommXCCL::all_to_all_single(
   size_t chunk_size = input.numel() / comm_size_;
   const auto data_type = getXcclDataType(input);
 
-#if XCCL_VERSION_CODE >= XCCL_VERSION(2, 28, 0)
   onecclResult_t result = xccl_api_->allToAll(
       input.data_ptr(),
       output.data_ptr(),
@@ -899,24 +898,6 @@ std::shared_ptr<TorchWork> TorchCommXCCL::all_to_all_single(
   if (result != onecclSuccess) {
     throw XCCLException(*xccl_api_, "XCCL AllToAll failed", result);
   }
-#else
-  size_t offset = chunk_size * wordSize(data_type);
-  char* sptr = static_cast<char*>(input.data_ptr());
-  char* rptr = static_cast<char*>(output.data_ptr());
-  xccl_api_->groupStart();
-
-  for (int i = 0; i < comm_size_; ++i) {
-    // Send to rank i
-    xccl_api_->send(
-        sptr + i * offset, chunk_size, data_type, i, xccl_comm_, stream);
-
-    // Receive from rank i
-    xccl_api_->recv(
-        rptr + i * offset, chunk_size, data_type, i, xccl_comm_, stream);
-  }
-
-  xccl_api_->groupEnd();
-#endif
 
   // Record end event after XCCL operation
   work->recordEnd();
@@ -1184,8 +1165,7 @@ std::shared_ptr<TorchWork> TorchCommXCCL::scatter(
             output_tensor.data_ptr(),
             input_tensor_list[root].data_ptr(),
             input_tensor_list[root].numel() *
-                input_tensor_list[root].element_size(),
-            xpuMemcpyDeviceToDevice,
+        input_tensor_list[root].element_size(),
             stream),
         "memcpyAsync failed");
   } else {
@@ -1273,7 +1253,6 @@ std::shared_ptr<TorchWork> TorchCommXCCL::gather(
             output_tensor_list[root].data_ptr(),
             input_tensor.data_ptr(),
             input_tensor.numel() * input_tensor.element_size(),
-            xpuMemcpyDeviceToDevice,
             stream),
         "memcpyAsync failed");
   } else {
@@ -1345,9 +1324,8 @@ std::shared_ptr<TorchCommBackend> TorchCommXCCL::split(
   // Create a new XCCL communicator
   onecclComm_t new_comm;
   xcclConfig_t config = XCCL_CONFIG_INITIALIZER;
-#if XCCL_VERSION_CODE >= XCCL_VERSION(2, 27, 0)
   config.commName = strdup(name.c_str());
-#endif
+
 
   // Populate XCCL config from user-provided hints
   populateXcclConfigFromHints(config, options, name);

@@ -5,13 +5,14 @@
 #include <memory>
 
 #include <ATen/ATen.h>
-#include <xpu_runtime.h> // @manual=third-party//xpu:xpu-lazy
+// #include <xpu_runtime.h> // @manual=third-party//xpu:xpu-lazy
 #include <torch/csrc/distributed/c10d/Store.hpp> // @manual=//caffe2:torch-cpp
 
 #include "comms/torchcomms/TorchCommOptions.hpp"
 #include "comms/torchcomms/device/XpuApi.hpp"
 #include "comms/torchcomms/xccl/XcclApi.hpp"
-#include "xccl.h" // @manual
+#include <oneapi/ccl.h>
+#include <oneapi/ccl.hpp>
 
 namespace torch {
 namespace comms {

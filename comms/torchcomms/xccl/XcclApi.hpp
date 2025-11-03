@@ -1,6 +1,7 @@
 #pragma once
 
-#include <oneapi/ccl.h> 
+#include <oneapi/ccl.h>
+#include <oneapi/ccl.hpp>
 
 namespace torch {
 namespace comms {
@@ -135,7 +136,7 @@ class XcclApi {
       onecclRedOp_t* op,
       void* scalar,
       onecclDataType_t datatype,
-      xcclScalarResidence_t residence,
+      onecclScalarResidence_t residence,
       onecclComm_t comm) = 0;
   virtual onecclResult_t redOpDestroy(onecclRedOp_t op, onecclComm_t comm) = 0;
 };
@@ -273,7 +274,7 @@ class DefaultXcclApi : public XcclApi {
       onecclRedOp_t* op,
       void* scalar,
       onecclDataType_t datatype,
-      xcclScalarResidence_t residence,
+      onecclScalarResidence_t residence,
       onecclComm_t comm) override;
   onecclResult_t redOpDestroy(onecclRedOp_t op, onecclComm_t comm) override;
 };

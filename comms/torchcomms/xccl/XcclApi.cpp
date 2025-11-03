@@ -154,7 +154,6 @@ onecclResult_t DefaultXcclApi::allToAll(
     onecclComm_t comm,
     xpuStream_t stream) {
   return onecclAlltoAll(sendbuff, recvbuff, count, datatype, comm, stream);
-#endif
 }
 
 onecclResult_t DefaultXcclApi::groupStart() {

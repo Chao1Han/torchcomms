@@ -14,7 +14,6 @@
 #include <vector>
 
 #include <ATen/ATen.h>
-#include <xpu_runtime.h> // @manual=third-party//xpu:xpu-lazy
 #include <torch/csrc/distributed/c10d/Store.hpp> // @manual=//caffe2:torch-cpp
 
 #include "comms/torchcomms/TorchComm.hpp"
