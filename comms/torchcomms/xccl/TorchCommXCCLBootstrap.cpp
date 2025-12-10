@@ -1,7 +1,7 @@
 #include "comms/torchcomms/xccl/TorchCommXCCLBootstrap.hpp"
 #include <ATen/xpu/XPUContext.h>
-#include <exception>
 #include <torch/csrc/distributed/c10d/TCPStore.hpp> // @manual
+#include <exception>
 #include "comms/torchcomms/StoreManager.hpp"
 #include "comms/torchcomms/TorchCommLogging.hpp"
 #include "comms/torchcomms/TorchCommUtils.hpp"

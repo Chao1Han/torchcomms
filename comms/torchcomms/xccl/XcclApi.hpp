@@ -40,11 +40,8 @@ class XcclApi {
       onecclComm_t* newcomm,
       onecclConfig_t* config) = 0;
 
-  virtual onecclResult_t commRegister(
-      onecclComm_t comm,
-      void* buffer,
-      size_t size,
-      void** handle) = 0;
+  virtual onecclResult_t
+  commRegister(onecclComm_t comm, void* buffer, size_t size, void** handle) = 0;
 
   virtual onecclResult_t commDeregister(onecclComm_t comm, void* handle) = 0;
 

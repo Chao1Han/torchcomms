@@ -49,7 +49,9 @@ void TorchWorkXCCL::recordEnd() {
       "Failed to record end event");
 }
 
-bool TorchWorkXCCL::isCompleted() { return state_ == WorkStatus::COMPLETED; }
+bool TorchWorkXCCL::isCompleted() {
+  return state_ == WorkStatus::COMPLETED;
+}
 
 TorchWorkXCCL::WorkStatus TorchWorkXCCL::checkStatus() {
   // If already marked as completed, return COMPLETED
