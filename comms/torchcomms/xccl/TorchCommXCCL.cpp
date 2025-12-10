@@ -1,25 +1,31 @@
 #include "comms/torchcomms/xccl/TorchCommXCCL.hpp"
 
-#include "comms/torchcomms/TorchCommFactory.hpp"
-#include "comms/torchcomms/TorchCommLogging.hpp"
-#include "comms/torchcomms/xccl/TorchCommXCCLBootstrap.hpp"
 #include <ATen/xpu/XPUContext.h>
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
+#include "comms/torchcomms/TorchCommFactory.hpp"
+#include "comms/torchcomms/TorchCommLogging.hpp"
+#include "comms/torchcomms/xccl/TorchCommXCCLBootstrap.hpp"
 
 namespace torch {
 namespace comms {
 
-onecclResult_t XCCLException::getResult() const { return result_; }
+onecclResult_t XCCLException::getResult() const {
+  return result_;
+}
 
 TorchCommXCCL::TorchCommXCCL()
-    : xccl_comm_{nullptr}, device_(at::kXPU),
-      init_state_(InitializationState::UNINITIALIZED), shutdown_(false) {}
+    : xccl_comm_{nullptr},
+      device_(at::kXPU),
+      init_state_(InitializationState::UNINITIALIZED),
+      shutdown_(false) {}
 
 TorchCommXCCL::TorchCommXCCL(const onecclComm_t xccl_comm)
-    : xccl_comm_(xccl_comm), device_(at::kXPU),
-      init_state_(InitializationState::UNINITIALIZED), shutdown_(false) {}
+    : xccl_comm_(xccl_comm),
+      device_(at::kXPU),
+      init_state_(InitializationState::UNINITIALIZED),
+      shutdown_(false) {}
 
 TorchCommXCCL::~TorchCommXCCL() {
   if (init_state_ == InitializationState::INITIALIZED) {
@@ -33,8 +39,10 @@ TorchCommXCCL::~TorchCommXCCL() {
   }
 }
 
-void TorchCommXCCL::init(at::Device device, const std::string &name,
-                         const CommOptions &options) {
+void TorchCommXCCL::init(
+    at::Device device,
+    const std::string& name,
+    const CommOptions& options) {
   // Initialize private members
   device_ = device;
   name_ = name;
@@ -71,11 +79,13 @@ void TorchCommXCCL::init(at::Device device, const std::string &name,
   }
 
   // Set XPU device and verify it' accessible
-  XPU_CHECK(xpu_api_, xpu_api_->setDevice(device_.index()),
-            "Failed to set XPU device to " + std::to_string(device_.index()));
+  XPU_CHECK(
+      xpu_api_,
+      xpu_api_->setDevice(device_.index()),
+      "Failed to set XPU device to " + std::to_string(device_.index()));
 
   // Read hints and store them
-  for (auto const &[key, val] : options_.hints) {
+  for (auto const& [key, val] : options_.hints) {
     if (key.starts_with("torchcomm::xccl::")) {
       if (key == "torchcomm::xccl::high_priority_stream") {
         high_priority_stream_ = string_to_bool(val);
@@ -97,23 +107,28 @@ void TorchCommXCCL::init(at::Device device, const std::string &name,
 
   // Initialize internal stream
   xpuStream_t temp_stream = xpu_api_->getCurrentXPUStream(device_.index());
-  XPU_CHECK(xpu_api_,
-            xpu_api_->streamCreateWithPriority(temp_stream, /*flags=*/0,
-                                               stream_priority),
-            "Failed to create internal XPU stream on device " +
-                std::to_string(device_.index()));
+  XPU_CHECK(
+      xpu_api_,
+      xpu_api_->streamCreateWithPriority(
+          temp_stream, /*flags=*/0, stream_priority),
+      "Failed to create internal XPU stream on device " +
+          std::to_string(device_.index()));
   internal_stream_ = std::move(temp_stream);
 
   // Create dependency event for stream synchronization
   xpuEvent_t temp_event(/*enable_timing=*/false);
-  XPU_CHECK(xpu_api_, xpu_api_->eventCreateWithFlags(temp_event, /*flags=*/0),
-            "Failed to create dependency event on device " +
-                std::to_string(device_.index()));
+  XPU_CHECK(
+      xpu_api_,
+      xpu_api_->eventCreateWithFlags(temp_event, /*flags=*/0),
+      "Failed to create dependency event on device " +
+          std::to_string(device_.index()));
   dependency_event_ = std::move(temp_event);
 
   // Allocate XPU buffer for barrier operations
-  XPU_CHECK(xpu_api_, xpu_api_->malloc(&barrier_buffer_, sizeof(float)),
-            "Failed to allocate barrier buffer");
+  XPU_CHECK(
+      xpu_api_,
+      xpu_api_->malloc(&barrier_buffer_, sizeof(float)),
+      "Failed to allocate barrier buffer");
 
   if (options_.hints.contains("torchcomm::xccl::max_event_pool_size")) {
     max_event_pool_size_ =
@@ -201,29 +216,35 @@ void TorchCommXCCL::finalize() {
     while (!event_pool_.empty()) {
       xpuEvent_t event = std::move(event_pool_.front());
       event_pool_.pop();
-      XPU_CHECK(xpu_api_, xpu_api_->eventDestroy(event),
-                "Failed to destroy event");
+      XPU_CHECK(
+          xpu_api_, xpu_api_->eventDestroy(event), "Failed to destroy event");
     }
   }
 
   // Free barrier buffer. TODO: handle errors on xpu free and stream destroy
   if (barrier_buffer_) {
-    XPU_CHECK(xpu_api_, xpu_api_->free(barrier_buffer_),
-              "Failed to free barrier buffer");
+    XPU_CHECK(
+        xpu_api_,
+        xpu_api_->free(barrier_buffer_),
+        "Failed to free barrier buffer");
     barrier_buffer_ = nullptr;
   }
 
   // Destroy dependency event
   if (dependency_event_.has_value()) {
-    XPU_CHECK(xpu_api_, xpu_api_->eventDestroy(dependency_event_.value()),
-              "Failed to destroy dependency event");
+    XPU_CHECK(
+        xpu_api_,
+        xpu_api_->eventDestroy(dependency_event_.value()),
+        "Failed to destroy dependency event");
     dependency_event_.reset();
   }
 
   // Destroy internal stream
   if (internal_stream_.has_value()) {
-    XPU_CHECK(xpu_api_, xpu_api_->streamDestroy(internal_stream_.value()),
-              "Failed to destroy internal stream");
+    XPU_CHECK(
+        xpu_api_,
+        xpu_api_->streamDestroy(internal_stream_.value()),
+        "Failed to destroy internal stream");
     internal_stream_.reset();
   }
 
@@ -268,13 +289,17 @@ int TorchCommXCCL::getSize() const {
   return comm_size;
 }
 
-std::string_view TorchCommXCCL::getBackendName() const { return kBackendName; }
+std::string_view TorchCommXCCL::getBackendName() const {
+  return kBackendName;
+}
 
-std::string_view TorchCommXCCL::getCommName() const { return name_; }
+std::string_view TorchCommXCCL::getCommName() const {
+  return name_;
+}
 
-static inline std::chrono::milliseconds
-getOperationTimeout(std::chrono::milliseconds timeout,
-                    std::chrono::milliseconds default_timeout) {
+static inline std::chrono::milliseconds getOperationTimeout(
+    std::chrono::milliseconds timeout,
+    std::chrono::milliseconds default_timeout) {
   // If timeout is kNoTimeout (0ms), use the default timeout from options
   if (timeout == kNoTimeout) {
     return default_timeout;
@@ -283,35 +308,81 @@ getOperationTimeout(std::chrono::milliseconds timeout,
 }
 
 // Point-to-Point Operations
-c10::intrusive_ptr<TorchWork> TorchCommXCCL::send(const at::Tensor &tensor,
-                                               int dst, bool async_op,
-                                               const SendOptions &options) {
-  throw std::runtime_error("XCCL send is not supported now and will be added later");
+c10::intrusive_ptr<TorchWork> TorchCommXCCL::send(
+    const at::Tensor& tensor,
+    int dst,
+    bool async_op,
+    const SendOptions& options) {
+  throw std::runtime_error(
+      "XCCL send is not supported now and will be added later");
 }
 
-c10::intrusive_ptr<TorchWork> TorchCommXCCL::recv(at::Tensor &tensor, int src,
-                                               bool async_op,
-                                               const RecvOptions &options) {
-  throw std::runtime_error("XCCL recv is not supported now and will be added later");
+c10::intrusive_ptr<TorchWork> TorchCommXCCL::recv(
+    at::Tensor& tensor,
+    int src,
+    bool async_op,
+    const RecvOptions& options) {
+  throw std::runtime_error(
+      "XCCL recv is not supported now and will be added later");
 }
 
 // Batch P2P Operations
-c10::intrusive_ptr<TorchWork>
-TorchCommXCCL::batch_op_issue(const std::vector<BatchSendRecv::P2POp> &ops,
-                              bool async_op, const BatchP2POptions &options) {
-  throw std::runtime_error("XCCL batch_op_issue is not supported now and will be added later");
+c10::intrusive_ptr<TorchWork> TorchCommXCCL::batch_op_issue(
+    const std::vector<BatchSendRecv::P2POp>& ops,
+    bool async_op,
+    const BatchP2POptions& options) {
+  throw std::runtime_error(
+      "XCCL batch_op_issue is not supported now and will be added later");
 }
 
-// Collective Operations
-c10::intrusive_ptr<TorchWork>
-TorchCommXCCL::broadcast(at::Tensor &tensor, int root, bool async_op,
-                         const BroadcastOptions &options) {
-  throw std::runtime_error("XCCL broadcast is not supported now and will be added later");
+c10::intrusive_ptr<TorchWork> TorchCommXCCL::broadcast(
+    at::Tensor& tensor,
+    int root,
+    bool async_op,
+    const BroadcastOptions& options) {
+  checkInitialized();
+  checkAndAbortIfTimedOutOrError();
+  ensureTensorContiguous(tensor);
+
+  tracing_->recordEventWithInputOutput("broadcast", rank_, {tensor}, {tensor});
+  xpuStream_t stream = getOperationStream(async_op);
+  auto work = createWork(
+      stream, getOperationTimeout(options.timeout, options_.timeout), {tensor});
+
+  work->recordStart();
+  // No-op for empty tensor
+  // TODO: Consider removing this check once oneCCL supports zero-sized tensors
+  // in broadcast operation.
+  if (tensor.numel() == 0) [[unlikely]] {
+    TC_LOG(WARNING) << "broadcast called with empty tensor";
+    work->recordEnd();
+    enqueueWork(work, stream);
+    return work;
+  }
+
+  const auto dataType = getXcclDataType(tensor);
+  onecclResult_t result = xccl_api_->broadcast(
+      tensor.data_ptr(),
+      tensor.data_ptr(),
+      tensor.numel(),
+      dataType,
+      root,
+      xccl_comm_,
+      stream);
+
+  if (result != onecclSuccess) {
+    throw XCCLException(*xccl_api_, "XCCL Broadcast failed", result);
+  }
+  work->recordEnd();
+  enqueueWork(work, stream);
+  return work;
 }
 
-c10::intrusive_ptr<TorchWork>
-TorchCommXCCL::all_reduce(at::Tensor &tensor, const ReduceOp &op, bool async_op,
-                          const AllReduceOptions &options) {
+c10::intrusive_ptr<TorchWork> TorchCommXCCL::all_reduce(
+    at::Tensor& tensor,
+    const ReduceOp& op,
+    bool async_op,
+    const AllReduceOptions& options) {
   checkInitialized();
   checkAndAbortIfTimedOutOrError();
   ensureTensorContiguous(tensor);
@@ -324,12 +395,25 @@ TorchCommXCCL::all_reduce(at::Tensor &tensor, const ReduceOp &op, bool async_op,
 
   work->recordStart();
 
+  // No-op for empty input tensor
+  // TODO: Consider removing this check once oneCCL supports zero-sized tensors
+  // for all_reduce operation.
+  if (tensor.numel() == 0) [[unlikely]] {
+    TC_LOG(WARNING) << "all_reduce called with empty input tensor";
+    work->recordEnd();
+    enqueueWork(work, stream);
+    return work;
+  }
+
   const auto dataType = getXcclDataType(tensor);
   onecclResult_t result = xccl_api_->allReduce(
       tensor.data_ptr(),
       tensor.data_ptr(), // In-place operation
-      tensor.numel(), dataType, getXcclReduceOp(op, xccl_comm_, dataType),
-      xccl_comm_, stream);
+      tensor.numel(),
+      dataType,
+      getXcclReduceOp(op, xccl_comm_, dataType),
+      xccl_comm_,
+      stream);
 
   if (result != onecclSuccess) {
     throw XCCLException(*xccl_api_, "XCCL AllReduce failed", result);
@@ -435,12 +519,16 @@ TorchCommXCCL::split(const std::vector<int> &ranks, const std::string &name,
   throw std::runtime_error("XCCL split is not supported now and will be added later");
 }
 
-XCCLException::XCCLException(XcclApi &xccl_api, const std::string &message,
-                             onecclResult_t result)
+XCCLException::XCCLException(
+    XcclApi& xccl_api,
+    const std::string& message,
+    onecclResult_t result)
     : message_(message + ": " + xccl_api.getErrorString(result)),
       result_(result) {}
 
-const char *XCCLException::what() const noexcept { return message_.c_str(); }
+const char* XCCLException::what() const noexcept {
+  return message_.c_str();
+}
 
 } // namespace comms
 } // namespace torch

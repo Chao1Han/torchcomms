@@ -177,8 +177,8 @@ setup(
             "gloo = torchcomms._comms_gloo",
             "rccl = torchcomms._comms_rccl",
             "rcclx = torchcomms._comms_rcclx",
-            "dummy = torchcomms._comms",
             "xccl = torchcomms._comms_xccl",
+            "dummy = torchcomms._comms",
         ]
     },
     ext_modules=ext_modules,
