@@ -11,14 +11,12 @@ using ::testing::DoAll;
 using ::testing::NiceMock;
 using ::testing::Return;
 
-namespace torch {
-namespace comms {
-namespace test {
+namespace torch::comms::test {
 
 class TorchcommRCCLXApiTest : public ::testing::Test {};
 
 TEST_F(TorchcommRCCLXApiTest, UnsupportedWindowApiTest) {
-  auto rcclx_api = std::make_unique<DefaultRcclxApi>();
+  std::unique_ptr<RcclxApi> rcclx_api = std::make_unique<DefaultRcclxApi>();
   ncclComm_t nccl_comm = nullptr;
   EXPECT_THROW(
       rcclx_api->winAllocate(0, nccl_comm, nullptr, nullptr, true, 0),
@@ -36,6 +34,4 @@ TEST_F(TorchcommRCCLXApiTest, UnsupportedWindowApiTest) {
       rcclx_api->winSignal(0, 0, 0, nullptr, nullptr), std::runtime_error);
 }
 
-} // namespace test
-} // namespace comms
-} // namespace torch
+} // namespace torch::comms::test

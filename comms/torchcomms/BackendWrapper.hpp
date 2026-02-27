@@ -1,6 +1,7 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 #pragma once
 
+#include <ATen/core/ivalue.h> // @manual=//caffe2:ATen-core
 #include <torch/csrc/distributed/c10d/Backend.hpp> // @manual=//caffe2:torch-cpp-cpu
 #include <torch/csrc/distributed/c10d/Store.hpp> // @manual=//caffe2:torch-cpp-cpu
 #include <torch/csrc/distributed/c10d/Work.hpp> // @manual=//caffe2:torch-cpp-cpu
@@ -9,12 +10,13 @@
 #include "comms/torchcomms/TorchCommTypes.hpp"
 #include "comms/torchcomms/TorchWork.hpp"
 
-namespace torch {
-namespace comms {
+namespace torch::comms {
 
 class WorkWrapper : public c10d::Work {
  public:
-  explicit WorkWrapper(c10::intrusive_ptr<TorchWork> work);
+  explicit WorkWrapper(
+      c10::intrusive_ptr<TorchWork> work,
+      std::vector<at::Tensor> outputTensors = {});
   ~WorkWrapper() override = default;
 
   bool isCompleted() override;
@@ -23,9 +25,13 @@ class WorkWrapper : public c10d::Work {
   void synchronize() override;
   bool wait(std::chrono::milliseconds timeout) override;
   std::vector<at::Tensor> result() override;
+  c10::intrusive_ptr<c10::ivalue::Future> getFuture() override;
 
  private:
+  friend class BackendWrapper;
   c10::intrusive_ptr<TorchWork> work_;
+  c10::intrusive_ptr<c10::ivalue::Future> future_;
+  std::vector<at::Tensor> outputTensors_;
 };
 
 using c10d::kUnsetTimeout;
@@ -125,6 +131,15 @@ class BackendWrapper : public c10d::Backend {
 
   c10::intrusive_ptr<c10d::Backend::Options> getBackendOptions() override;
 
+  // Verify that a work object has the expected timeout.
+  // Used for testing timeout propagation.
+  bool verifyWorkTimeoutForTest(
+      const c10::intrusive_ptr<c10d::Work>& work,
+      const std::chrono::milliseconds& timeout);
+
+  // Set the default timeout for this backend.
+  void setTimeout(std::chrono::milliseconds timeout) override;
+
   // Split communicator into a subgroup and return a new BackendWrapper
   c10::intrusive_ptr<Backend> split(
       const c10::intrusive_ptr<c10d::Store>& store,
@@ -137,5 +152,4 @@ class BackendWrapper : public c10d::Backend {
   c10::intrusive_ptr<Options> options_;
 };
 
-} // namespace comms
-} // namespace torch
+} // namespace torch::comms

@@ -14,6 +14,7 @@
 #include "comms/ctran/mapper/CtranMapper.h"
 #include "comms/ctran/memory/memCacheAllocator.h"
 #include "comms/ctran/utils/CtranIpc.h"
+#include "comms/pipes/P2pNvlTransportDevice.cuh"
 #include "comms/utils/logger/Logger.h"
 
 #define LOCAL_RANK_TO_DEV_REGION_POS(localRank, ownerLocalRank) \
@@ -30,7 +31,7 @@ constexpr int kExpectedCommAttrLength = 5;
 // The following two values are used to allocate tmpbuf for
 // AllToAllvDynamic.
 // TODO: if model scale become larger, need to figure out ways to reduce
-// these value to avoid allocate a large staing buffer.
+// these value to avoid allocate a large staging buffer.
 // TODO: move the following and the tmpbuff allocation logic out of CtranAlgo,
 // and create new funcs in A2AvDynamic's own logic.
 inline size_t all2allvDynamicMaxSendcounts = 0;
@@ -44,10 +45,13 @@ class CtranAlgo {
 
   ~CtranAlgo();
 
-  // intialize device state and SharedResource, if needed
+  // initialize device state and SharedResource, if needed
   commResult_t initKernelResources();
   // Get device state
   CtranAlgoDeviceState* getDevState();
+  // Get base pointer to pre-allocated P2pNvlTransportDevice array
+  // Array is indexed by peer local rank
+  comms::pipes::P2pNvlTransportDevice* getNvlTransportsBase();
 
   // accessing allGatherAlgo
   void setAllGatherAlgo(enum NCCL_ALLGATHER_ALGO algo);
@@ -112,6 +116,10 @@ class CtranAlgo {
     RING_TMP_SEND_BUF,
     RING_TMP_RECV_BUF,
 
+    // Reverse direction buffers for bi-directional AllGather in Ring AllReduce
+    RING_TMP_SEND_BUF_REV,
+    RING_TMP_RECV_BUF_REV,
+
     NUM_TMPBUFS,
   };
 
@@ -143,6 +151,7 @@ class CtranAlgo {
   // Reference to the ctran object that owns this algo.
   ICtran* ctran_{nullptr};
 
+  CtranAlgoDeviceState devState_;
   // Device buffer to store all states of
   // shared device buffers and comm info, accessed by kernels.
   CtranAlgoDeviceState* devState_d_{nullptr};
@@ -171,6 +180,10 @@ class CtranAlgo {
   std::unordered_map<enum CollType, CtranIbConfig> collToVcConfigMap_;
   std::unique_ptr<ctran::algos::allreduce::AllReduceResourceImpl>
       allReduceDirectResource{nullptr};
+  // Pre-allocated array of P2pNvlTransportDevice objects for all peers
+  // Allocated with cudaMalloc for device accessibility
+  // Indexed by peer local rank, slot for self (localRank) is unused
+  comms::pipes::P2pNvlTransportDevice* nvlTransports_{nullptr};
 };
 
 class CtranAlgo::SharedResource {

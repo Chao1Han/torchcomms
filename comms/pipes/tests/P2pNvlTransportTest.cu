@@ -1,6 +1,5 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 
-#include "comms/pipes/P2pNvlTransportDevice.cuh"
 #include "comms/pipes/tests/Checks.h"
 #include "comms/pipes/tests/P2pNvlTransportTest.cuh"
 
@@ -139,8 +138,10 @@ void testSend(
     int numBlocks,
     int blockSize,
     GroupType groupType,
-    int /*blocksPerGroup*/) {
-  testSendKernel<<<numBlocks, blockSize>>>(p2p, src_d, nbytes, groupType);
+    int /*blocksPerGroup*/,
+    cudaStream_t stream) {
+  testSendKernel<<<numBlocks, blockSize, 0, stream>>>(
+      p2p, src_d, nbytes, groupType);
   PIPES_KERNEL_LAUNCH_CHECK();
 }
 
@@ -151,8 +152,10 @@ void testRecv(
     int numBlocks,
     int blockSize,
     GroupType groupType,
-    int /*blocksPerGroup*/) {
-  testRecvKernel<<<numBlocks, blockSize>>>(p2p, dst_d, nbytes, groupType);
+    int /*blocksPerGroup*/,
+    cudaStream_t stream) {
+  testRecvKernel<<<numBlocks, blockSize, 0, stream>>>(
+      p2p, dst_d, nbytes, groupType);
   PIPES_KERNEL_LAUNCH_CHECK();
 }
 
@@ -239,6 +242,63 @@ void testWeightedRecvSend(
     GroupType groupType) {
   testWeightedRecvSendKernel<<<numBlocks, blockSize>>>(
       p2p, recv_d, send_d, nbytes, recvWeight, sendWeight, groupType);
+  PIPES_KERNEL_LAUNCH_CHECK();
+}
+
+// =============================================================================
+// write() test kernel and wrapper
+// =============================================================================
+
+__global__ void testPutWithSignalKernel(
+    P2pNvlTransportDevice p2p,
+    char* dst_d,
+    const char* src_d,
+    uint64_t signal_id,
+    size_t nbytes,
+    GroupType groupType) {
+  auto group = make_group(groupType);
+  auto writtenBytes = p2p.put(group, dst_d, src_d, nbytes);
+  p2p.signal_threadgroup(group, signal_id, SignalOp::SIGNAL_ADD, writtenBytes);
+}
+
+void testPutWithSignal(
+    P2pNvlTransportDevice p2p,
+    char* dst_d,
+    const char* src_d,
+    uint64_t signal_id,
+    size_t nbytes,
+    int numBlocks,
+    int blockSize,
+    GroupType groupType) {
+  testPutWithSignalKernel<<<numBlocks, blockSize>>>(
+      p2p, dst_d, src_d, signal_id, nbytes, groupType);
+  PIPES_KERNEL_LAUNCH_CHECK();
+}
+
+// =============================================================================
+// wait() test kernel and wrapper
+// =============================================================================
+
+__global__ void testWaitKernel(
+    P2pNvlTransportDevice p2p,
+    CmpOp op,
+    uint64_t signal_id,
+    uint64_t expected,
+    GroupType groupType) {
+  auto group = make_group(groupType);
+  p2p.wait_signal_until_threadgroup(group, signal_id, op, expected);
+}
+
+void testWait(
+    P2pNvlTransportDevice p2p,
+    CmpOp op,
+    uint64_t signal_id,
+    uint64_t expected,
+    int numBlocks,
+    int blockSize,
+    GroupType groupType) {
+  testWaitKernel<<<numBlocks, blockSize>>>(
+      p2p, op, signal_id, expected, groupType);
   PIPES_KERNEL_LAUNCH_CHECK();
 }
 

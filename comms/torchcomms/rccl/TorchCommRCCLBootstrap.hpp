@@ -12,8 +12,7 @@
 #include "comms/torchcomms/rccl/RcclApi.hpp" // @manual
 #include "rccl.h" // @manual=//comms/rccl:rccl-dev
 
-namespace torch {
-namespace comms {
+namespace torch::comms {
 
 constexpr uint16_t kTCPStorePort = 29500;
 
@@ -25,7 +24,7 @@ class TorchCommRCCLBootstrap {
       std::shared_ptr<RcclApi> rccl_api,
       std::shared_ptr<HipApi> hip_api,
       std::chrono::milliseconds timeout);
-  ~TorchCommRCCLBootstrap();
+  ~TorchCommRCCLBootstrap() noexcept;
 
   // Delete copy and move operations
   TorchCommRCCLBootstrap(const TorchCommRCCLBootstrap&) = delete;
@@ -71,5 +70,4 @@ class TorchCommRCCLBootstrap {
   std::string uniqueid_xchg_method_;
 };
 
-} // namespace comms
-} // namespace torch
+} // namespace torch::comms

@@ -1,434 +1,194 @@
 # RCCLX Snapshots
 
-This directory contains the infrastructure for managing snapshots of rcclx static library builds across different ROCm versions.
+This directory contains the infrastructure for managing snapshots of rcclx sources for the `rcclx-stable` and `rcclx-last-stable` targets.
 
-## Storage Architecture
+## Overview
 
-The snapshot system uses a **dual-storage approach** to optimize for both size and accessibility:
+The snapshot system uses **pre-extracted sources** committed to the repository. When building `rcclx-stable` or `rcclx-last-stable`, the sources are compiled from the snapshot directory rather than the main rcclx directory.
 
-- **Artifacts (large `.a` files)**: Stored in Manifold bucket `rcclx_prebuilt_artifacts`
-- **Headers and Metadata (small files)**: Stored in the repository for easy access, version control, and header/binary compatibility
+This approach **eliminates ABI mismatch issues** because all code (rcclx + dependencies) compiles together at build time with current external headers (folly, scribe, thrift, etc.).
 
-### Manifold Structure (Artifacts)
+## Quick Start
 
-## Manifold Structure (Artifacts)
+### Creating a New Snapshot
 
-Manifold stores the actual library binary files (`.a` files):
+```bash
+cd fbcode
 
+# Snapshot from specific commit
+python3 comms/rcclx/snapshots/scripts/create_snapshot.py \
+    --stage stable \
+    --commit <commit-hash> \
+    --snapshots-root comms/rcclx/snapshots \
+    --repo-root /path/to/fbsource
+
+# Snapshot from current HEAD
+python3 comms/rcclx/snapshots/scripts/create_snapshot.py \
+    --stage stable \
+    --snapshots-root comms/rcclx/snapshots \
+    --repo-root /path/to/fbsource
+
+# Rotate stable → last-stable, then create new stable
+python3 comms/rcclx/snapshots/scripts/create_snapshot.py \
+    --stage stable \
+    --commit <commit-hash> \
+    --rotate \
+    --snapshots-root comms/rcclx/snapshots \
+    --repo-root /path/to/fbsource
 ```
-rcclx_prebuilt_artifacts/tree/
-├── stable/               # Current stable snapshots
-│   ├── 6.2/librcclx-dev.a
-│   ├── 6.4/librcclx-dev.a
-│   └── 7.0/librcclx-dev.a
-├── last_stable/          # Previous stable snapshots (for rollback)
-│   ├── 6.2/librcclx-dev.a
-│   ├── 6.4/librcclx-dev.a
-│   └── 7.0/librcclx-dev.a
-└── archives/             # Historical snapshots
-    ├── 6.2/
-    │   ├── 20250107_143000_librcclx-dev.a
-    │   ├── 20250108_091500_librcclx-dev.a
-    │   └── ...
-    ├── 6.4/
-    │   ├── 20250107_143000_librcclx-dev.a
-    │   └── ...
-    └── 7.0/
-        ├── 20250107_143000_librcclx-dev.a
-        └── ...
+
+### Building with Snapshots
+
+```bash
+# Build with stable snapshot
+buck2 build //comms/rcclx:rcclx-stable --modifier=rocm70
+
+# Build with last-stable snapshot
+buck2 build //comms/rcclx:rcclx-last-stable --modifier=rocm70
+
+# Build using modifier to select snapshot
+buck2 build -m rcclx_stable //comms/rcclx:rcclx --modifier=rocm70
 ```
 
-### Repository Structure (Metadata and Headers)
-
-The repository stores both metadata files and header files to ensure header/binary compatibility:
+## Directory Structure
 
 ```
 snapshots/
-├── scripts/           # Automation scripts
-├── stable/           # Current stable snapshots (metadata + headers)
-│   ├── 6.2/
-│   │   ├── metadata.txt
-│   │   └── rccl.h
-│   ├── 6.4/
-│   │   ├── metadata.txt
-│   │   └── rccl.h
-│   └── 7.0/
-│       ├── metadata.txt
-│       └── rccl.h
-├── last-stable/      # Previous stable snapshots (metadata + headers)
-│   ├── 6.2/
-│   │   ├── metadata.txt
-│   │   └── rccl.h
-│   ├── 6.4/
-│   │   ├── metadata.txt
-│   │   └── rccl.h
-│   └── 7.0/
-│       ├── metadata.txt
-│       └── rccl.h
-└── archives/         # Historical snapshots with timestamp-prefixed files
-    ├── 6.2/
-    │   ├── 20250107_143000_metadata.txt
-    │   ├── 20250107_143000_rccl.h
-    │   ├── 20250108_091500_metadata.txt
-    │   ├── 20250108_091500_rccl.h
-    │   └── ...
-    ├── 6.4/
-    │   ├── 20250107_143000_metadata.txt
-    │   ├── 20250107_143000_rccl.h
-    │   └── ...
-    └── 7.0/
-        ├── 20250107_143000_metadata.txt
-        ├── 20250107_143000_rccl.h
-        └── ...
+├── stable/
+│   ├── rcclx/                    # Pre-extracted rcclx sources
+│   │   ├── BUCK
+│   │   ├── defs.bzl
+│   │   ├── rccl_build_config.bzl
+│   │   └── develop/
+│   │       ├── src/
+│   │       ├── meta/
+│   │       └── ...
+│   └── metadata.txt              # Commit hash, timestamp
+├── last-stable/
+│   ├── rcclx/                    # Pre-extracted rcclx sources
+│   └── metadata.txt
+├── scripts/
+│   ├── create_snapshot.py        # Main snapshot creation script
+│   └── constants.py              # Configuration constants
+├── DESIGN_PRE_EXTRACTED_SOURCES.md  # Design document
+└── README.md                     # This file
 ```
 
-## Automatic Checksum Management
+## How It Works
 
-The snapshot system automatically manages SHA256 checksums without requiring manual updates to BUCK files. Here's how it works:
+### Build-Time Flow
 
-### Checksum Storage and Loading
+```
+User runs: buck2 build //comms/rcclx:rcclx-stable --modifier=rocm70
 
-1. **Metadata Files**: When a snapshot is created, checksums are stored in `metadata.txt` files:
-   ```
-   Snapshot created: 2025-01-15 14:30:00 UTC
-   ROCm version: 6.4
+Buck2 resolves:
+  //comms/rcclx:rcclx-stable
+    → alias to //comms/rcclx/snapshots/stable/rcclx:rcclx-dev
 
-   Checksums:
-     sha1: f90de30eaf1159ec0ad5060d962e0220baf222f0
-     sha256: bda119893a092d421e431edf7fe02340eacccb23ee514ddec5a7962e869f9bf9
+Buck2 builds from:
+  snapshots/stable/rcclx/BUCK (frozen rcclx source)
+    ├── //comms/ctran:...        (from HEAD)
+    ├── //comms/utils:...        (from HEAD)
+    ├── //comms/common:...       (from HEAD)
+    └── //folly:..., //scribe:.. (from HEAD)
 
-   Commit Hashes:
-     fbsource: abc123def456...
-     rcclx: 789ghi012jkl...
-   ```
+Result:
+  All code compiled together with current headers
+  → No ABI mismatch
+```
 
-2. **Checksums File**: The script generates `comms/rcclx/stable_checksums.bzl` from all metadata files:
-   ```python
-   # AUTO-GENERATED FILE - DO NOT EDIT MANUALLY
-   # This file is generated by generate_checksums_bzl.py
+### Why This Solves ABI Issues
 
-   RCCLX_STABLE_CHECKSUMS = {
-       "6.2": "bda119893a092d421e431edf7fe02340eacccb23ee514ddec5a7962e869f9bf9",
-       "6.4": "abc123def456...",
-       "7.0": "789ghi012jkl...",
-   }
+The previous "bundled dependencies" approach precompiled internal dependencies (`librcclxdeps.a`) which caused ABI mismatches when external dependencies (folly, scribe, thrift) changed.
 
-   RCCLX_LAST_STABLE_CHECKSUMS = {
-       "6.2": "old_checksum_here...",
-       "6.4": "old_checksum_here...",
-       "7.0": "old_checksum_here...",
-   }
-   ```
+With pre-extracted sources:
+- **rcclx sources** are frozen at snapshot time
+- **Internal deps** (ctran, utils, logger) compile from HEAD
+- **External deps** (folly, scribe, thrift) compile from HEAD
+- **All code uses the same headers** at compile time = No ABI mismatch
 
-3. **BUCK File Loading**: The BUCK file loads checksums dynamically:
-   ```python
-   load(":stable_checksums.bzl", "RCCLX_STABLE_CHECKSUMS", "RCCLX_LAST_STABLE_CHECKSUMS")
+## Script Reference
 
-   manifold_get(
-       name = "rcclx-stable-6.4-artifact",
-       sha256 = RCCLX_STABLE_CHECKSUMS.get("6.4", "0" * 64),
-       ...
-   )
-   ```
+### create_snapshot.py
 
-### Workflow
+Main script for creating source snapshots.
 
-The entire process is automatic when creating snapshots:
+**Arguments:**
+| Argument | Required | Description |
+|----------|----------|-------------|
+| `--stage` | Yes | Snapshot stage: `stable` or `last-stable` |
+| `--commit` | No | Commit hash to snapshot from (default: current HEAD) |
+| `--snapshots-root` | Yes | Path to snapshots directory |
+| `--repo-root` | Yes | Path to repository root |
+| `--rotate` | No | If creating stable, first copy current stable to last-stable |
+
+**Examples:**
+```bash
+# Create stable snapshot from specific commit
+python3 create_snapshot.py \
+    --stage stable \
+    --commit abc123def456 \
+    --snapshots-root comms/rcclx/snapshots \
+    --repo-root /path/to/fbsource
+
+# Rotate and create new stable
+python3 create_snapshot.py \
+    --stage stable \
+    --commit abc123def456 \
+    --rotate \
+    --snapshots-root comms/rcclx/snapshots \
+    --repo-root /path/to/fbsource
+```
+
+## Metadata
+
+Each snapshot includes a `metadata.txt` file recording:
+- Commit hash
+- Commit date
+- Commit description
+- Snapshot creation timestamp
+
+Example:
+```
+# RCCLX Snapshot Metadata
+commit: abc123def456...
+commit_date: 2026-02-01 12:00:00
+commit_description: Fix critical bug in rcclx
+snapshot_created: 2026-02-01T12:30:00.000000
+created_by: create_snapshot.py
+```
+
+## Testing
+
+After creating or updating snapshots:
 
 ```bash
-./comms/rcclx/snapshots/scripts/create_snapshot_wrapper.sh --rocm-version 6.4
+# Test stable builds for all ROCm versions
+buck2 build //comms/rcclx:rcclx-stable --modifier=rocm621
+buck2 build //comms/rcclx:rcclx-stable --modifier=rocm64
+buck2 build //comms/rcclx:rcclx-stable --modifier=rocm70
+
+# Test last-stable builds
+buck2 build //comms/rcclx:rcclx-last-stable --modifier=rocm70
+
+# Run tests with stable snapshot
+buck2 test @fbcode//mode/opt-amd-gpu -m rocm70 -m rcclx_stable \
+    fbcode//param_bench/train/comms/cpp/rccl-tests/src:
 ```
 
-This command automatically:
-1. Builds the library for ROCm 6.4
-2. Calculates SHA256 checksum
-3. Stores checksum in `snapshots/stable/6.4/metadata.txt`
-4. Uploads artifact to Manifold
-5. Regenerates `stable_checksums.bzl` from all metadata files
-6. BUCK file automatically uses the new checksum on next build
-
-**No manual checksum updates required!**
-
-### Initial Setup
-
-An empty `stable_checksums.bzl` is checked into the repository to allow BUCK files to load even before any snapshots exist:
-
-```python
-# Empty default file
-RCCLX_STABLE_CHECKSUMS = {}
-RCCLX_LAST_STABLE_CHECKSUMS = {}
-```
-
-When you create your first snapshot, this file is automatically populated with the calculated checksums.
-
-The snapshot system allows you to:
-1. Build rcclx with specific ROCm versions
-2. Create tagged stable snapshots of the built archives (stored in Manifold)
-3. Maintain version history with automatic rotation (stable → last-stable → archives)
-4. Track metadata including commit hashes and dependencies (stored in repo)
-5. Use pre-built stable snapshots for faster builds and validated releases
-
-### Build Targets
-
-There are three main build targets for rcclx:
-
-- **`rcclx-dev`**: Builds rcclx from source (current top-of-tree)
-  - Use when you're developing new features or testing changes
-  - Always builds from the latest source code
-  - Takes longer to build as it compiles everything from scratch
-
-- **`rcclx-stable`**: Uses pre-built stable snapshots
-  - Use for production deployments or when you need validated builds
-  - Much faster as it skips compilation
-  - Automatically selects the correct snapshot based on ROCm version constraint
-  - Requires that a stable snapshot exists for the specified ROCm version
-
-- **`rcclx-last-stable`**: Uses the previous stable snapshot (for rollback)
-  - Use when issues are found with the current stable build
-  - Provides a quick rollback to the last known good build
-  - Automatically selects the correct snapshot based on ROCm version constraint
-  - Requires that a last-stable snapshot exists for the specified ROCm version
-
-## Usage
-
-### Using Constraints for Automatic Target Selection (Recommended)
-
-The simplest and recommended way to use rcclx is with the `-m` constraint flags, which automatically select the appropriate target:
-
-```bash
-# Build from source (default)
-buck2 build @fbcode//mode/opt-amd-gpu fbcode//comms/rcclx:rcclx
-buck2 build @fbcode//mode/opt-amd-gpu -m rcclx_dev fbcode//comms/rcclx:rcclx
-
-# Use stable snapshot (fast, validated builds)
-buck2 build @fbcode//mode/opt-amd-gpu -m rcclx_stable fbcode//comms/rcclx:rcclx
-
-# Use last-stable snapshot (for rollback)
-buck2 build @fbcode//mode/opt-amd-gpu -m rcclx_last_stable fbcode//comms/rcclx:rcclx
-```
-
-You can combine the rcclx constraint with ROCm version constraints:
-
-```bash
-# Use stable snapshot with ROCm 6.4
-buck2 build @fbcode//mode/opt-amd-gpu -m rcclx_stable -m rocm64 fbcode//comms/rcclx:rcclx
-
-# Use last-stable snapshot with ROCm 7.0
-buck2 build @fbcode//mode/opt-amd-gpu -m rcclx_last_stable -m rocm70 fbcode//comms/rcclx:rcclx
-```
-
-### Using Stable Snapshots (rcclx-stable)
-
-The `rcclx-stable` target allows you to use pre-built stable snapshots instead of building from source. This is faster and ensures you're using validated builds. The artifacts are automatically fetched from Manifold during the build:
-
-```bash
-# Use stable snapshot for ROCm 6.2
-buck2 build @fbcode//mode/opt-amd-gpu -m ovr_config//third-party/rocm/constraints:6.2.1 fbcode//comms/rcclx:rcclx-stable
-
-# Use stable snapshot for ROCm 6.4
-buck2 build @fbcode//mode/opt-amd-gpu -m ovr_config//third-party/rocm/constraints:6.4.2 fbcode//comms/rcclx:rcclx-stable
-
-# Use stable snapshot for ROCm 7.0
-buck2 build @fbcode//mode/opt-amd-gpu -m ovr_config//third-party/rocm/constraints:7.0 fbcode//comms/rcclx:rcclx-stable
-```
-
-The build system automatically:
-1. Selects the correct stable snapshot based on the ROCm version constraint
-2. Downloads the artifact from Manifold at `rcclx_prebuilt_artifacts/tree/stable/<version>/librcclx-dev.a`
-3. Uses the downloaded artifact for linking
-
-If a stable snapshot doesn't exist in Manifold for the specified version, the build will fail with a clear error message.
-
-### Using Last-Stable Snapshots (rcclx-last-stable)
-
-The `rcclx-last-stable` target provides quick rollback capability by using the previous stable snapshot. Use this when issues are discovered with the current stable build. The artifacts are automatically fetched from Manifold during the build:
-
-```bash
-# Rollback to last-stable snapshot for ROCm 6.2
-buck2 build @fbcode//mode/opt-amd-gpu -m ovr_config//third-party/rocm/constraints:6.2.1 fbcode//comms/rcclx:rcclx-last-stable
-
-# Rollback to last-stable snapshot for ROCm 6.4
-buck2 build @fbcode//mode/opt-amd-gpu -m ovr_config//third-party/rocm/constraints:6.4.2 fbcode//comms/rcclx:rcclx-last-stable
-
-# Rollback to last-stable snapshot for ROCm 7.0
-buck2 build @fbcode//mode/opt-amd-gpu -m ovr_config//third-party/rocm/constraints:7.0 fbcode//comms/rcclx:rcclx-last-stable
-```
-
-The build system automatically:
-1. Selects the correct last-stable snapshot based on the ROCm version constraint
-2. Downloads the artifact from Manifold at `rcclx_prebuilt_artifacts/tree/last_stable/<version>/librcclx-dev.a`
-3. Uses the downloaded artifact for linking
-
-This is particularly useful for quickly reverting to a known good state while investigating issues with the current stable build.
-
-### Creating a Snapshot
-
-To create a new snapshot for a specific ROCm version, use the wrapper script from the fbcode directory:
-
-```bash
-# From fbcode directory
-cd /path/to/fbsource/fbcode
-
-# For ROCm 6.2
-./comms/rcclx/snapshots/scripts/create_snapshot_wrapper.sh --rocm-version 6.2
-
-# For ROCm 6.4
-./comms/rcclx/snapshots/scripts/create_snapshot_wrapper.sh --rocm-version 6.4
-
-# For ROCm 7.0
-./comms/rcclx/snapshots/scripts/create_snapshot_wrapper.sh --rocm-version 7.0
-```
-
-The wrapper script will:
-1. Build the rcclx-dev library with the specified ROCm version
-2. Run the snapshot creation script to rotate archives and create metadata
-3. Upload the artifact to Manifold at `rcclx_prebuilt_artifacts/tree/stable/<rocm_version>/`
-4. Save metadata to the repo at `comms/rcclx/snapshots/stable/<rocm_version>/metadata.txt`
-
-### What Happens During Snapshot Creation
-
-When you run a snapshot build, the following operations occur in order:
-
-1. **Build**: The rcclx library is built with the specified ROCm version constraints
-
-2. **Archive Previous (if last-stable exists)**:
-   - **Metadata**: Moved from `last-stable/<version>/` to `archives/<version>/<timestamp>/` in repo
-   - **Artifact**: Copied from Manifold `last_stable/<version>/` to `archives/<version>/<timestamp>/` in Manifold
-
-3. **Rotate Current (if stable exists)**:
-   - **Metadata**: Moved from `stable/<version>/` to `last-stable/<version>/` in repo
-   - **Artifact**: Copied from Manifold `stable/<version>/` to `last_stable/<version>/` in Manifold
-
-4. **Calculate Checksums**: SHA256 and SHA1 checksums are calculated for the newly built library
-
-5. **Install New**:
-   - **Artifact**: Newly built `librcclx-dev.a` uploaded to Manifold at `stable/<version>/`
-   - **Metadata**: Created in repo at `stable/<version>/metadata.txt` with checksums
-
-6. **Update Checksums File**: Automatically regenerates `comms/rcclx/stable_checksums.bzl` from all metadata files
-
-The snapshot creation process is fully automated and requires no manual checksum management.
-
-### Getting Checksums for BUCK File
-
-The snapshot creation workflow automatically generates checksums and updates the BUCK file configuration. No manual intervention is required!
-
-When you create a snapshot using the wrapper script:
-
-```bash
-cd /path/to/fbsource/fbcode
-./comms/rcclx/snapshots/scripts/create_snapshot_wrapper.sh --rocm-version 6.4
-```
-
-The script automatically:
-1. Builds the rcclx library for the specified ROCm version
-2. Calculates SHA256 checksums for the built library
-3. Stores checksums in `snapshots/stable/<version>/metadata.txt`
-4. Uploads the artifact to Manifold
-5. **Generates `comms/rcclx/stable_checksums.bzl`** from all metadata files
-
-The BUCK file loads checksums from `stable_checksums.bzl`:
-
-```python
-load(":stable_checksums.bzl", "RCCLX_STABLE_CHECKSUMS")
-
-manifold_get(
-    name = "rcclx-stable-6.4-artifact",
-    ...
-    sha256 = RCCLX_STABLE_CHECKSUMS.get("6.4", "0" * 64),
-    ...
-)
-```
-
-This approach eliminates manual checksum management - the checksums are automatically read from metadata files and applied to BUCK targets.
-
-**Manual Checksum Regeneration (if needed)**
-
-If you need to regenerate `stable_checksums.bzl` manually:
-
-```bash
-buck2 run fbcode//comms/rcclx/snapshots/scripts:generate_checksums_bzl -- \
-    --snapshots-root "$(pwd)/comms/rcclx/snapshots" \
-    --output "$(pwd)/comms/rcclx/stable_checksums.bzl"
-```
-
-### Accessing Artifacts from Manifold
-
-To download a pre-built artifact from Manifold, you can use the Manifold API or command-line tools:
-
-```python
-from manifold.clients.python import ManifoldClient
-from datetime import timedelta
-import io
-
-# Download stable artifact for ROCm 6.4
-async def download_artifact():
-    with ManifoldClient(bucket="rcclx_prebuilt_artifacts", apiKey="rcclx_prebuilt_artifacts-key") as client:
-        buffer = io.BytesIO()
-        await client.get(
-            path="tree/stable/6.4/librcclx-dev.a",
-            output=buffer,
-            timeout=timedelta(seconds=600),
-        )
-
-        # Save to local file
-        with open("librcclx-dev.a", "wb") as f:
-            f.write(buffer.getvalue())
-```
-
-### Snapshot Metadata
-
-Each stable snapshot includes a `metadata.txt` file with information about the build:
-
-```
-Snapshot created: 2025-01-15 14:30:00 UTC
-ROCm version: 6.4
-
-Commit Hashes:
-  fbsource: abc123def456...
-  rcclx: 789ghi012jkl...
-```
-
-This metadata allows you to trace each snapshot back to its exact source code state.
-
-## Directory Purposes
-
-- **scripts/**: Contains automation scripts used by the build system
-  - `create_snapshot.py`: Main script that handles snapshot creation and rotation
-
-- **stable/**: Contains the current stable snapshot for each ROCm version
-  - This is where you should find the latest validated builds
-  - Each subdirectory contains the library archive and metadata
-
-- **last-stable/**: Contains the previous stable snapshot for each ROCm version
-  - Provides a quick rollback option if issues are found with the current stable
-  - Automatically populated when creating a new stable snapshot
-
-- **archives/**: Contains historical snapshots organized by ROCm version and timestamp
-  - Format: `archives/<rocm_version>/<YYYYMMDD_HHMMSS>/`
-  - Provides long-term version history
-  - Automatically populated when rotating snapshots
-
-## Example Workflow
-
-1. Developer makes changes to rcclx
-2. Changes are tested and validated
-3. Run snapshot build for ROCm 6.4:
-   ```bash
-   cd /path/to/fbsource/fbcode
-   ./comms/rcclx/snapshots/scripts/create_snapshot_wrapper.sh --rocm-version 6.4
-   ```
-4. The snapshot system:
-   - Archives the old last-stable to `archives/6.4/<timestamp>/` (metadata in repo, artifact in Manifold)
-   - Moves current stable to `last-stable/6.4/` (metadata in repo, artifact in Manifold)
-   - Installs new build to `stable/6.4/` in Manifold
-   - Creates metadata file with commit hashes in repo
-
-## Notes
-
-- **Artifacts** (.a files) are stored in Manifold to avoid bloating the repository with large binary files
-- **Metadata** (metadata.txt) is stored in the repository for easy access and version control
-- Each ROCm version maintains its own independent snapshot history
-- The snapshot system is designed to work with the existing rcclx-dev build target
-- All snapshot operations are atomic and safe (creates backups before modifications)
-- Timestamp format `YYYYMMDD_HHMMSS` ensures consistent naming across repo and Manifold archives
+## Design Documents
+
+- **[DESIGN_PRE_EXTRACTED_SOURCES.md](DESIGN_PRE_EXTRACTED_SOURCES.md)** - Current design (pre-extracted sources)
+- **[DESIGN_BUNDLED_DEPS.md](DESIGN_BUNDLED_DEPS.md)** - Deprecated design (bundled dependencies)
+
+## Benefits
+
+| Benefit | Description |
+|---------|-------------|
+| **No ABI mismatches** | All code compiles together at build time with current headers |
+| **Reuses existing BUCK files** | Snapshot includes rcclx's BUCK, used directly |
+| **Same build as rcclx-dev** | `rcclx-stable` is alias to `snapshots/stable/rcclx:rcclx-dev` |
+| **Full Buck caching** | Standard Buck compilation, incremental builds work |
+| **Simple to maintain** | Update = extract rcclx/ from a commit |
+| **Easy to debug** | Standard Buck build, standard tools |
+| **No Manifold dependency** | Sources committed to repo |

@@ -17,9 +17,7 @@
 #include "comms/torchcomms/ncclx/TorchCommNCCLXCCA.hpp"
 #include "comms/torchcomms/ncclx/tests/unit/cpp/mocks/CachingAllocatorHookMock.hpp"
 
-namespace torch {
-namespace comms {
-namespace test {
+namespace torch::comms::test {
 
 // ============================================================================
 // 1. INITIALIZATION TESTS
@@ -28,16 +26,16 @@ namespace test {
 TEST_F(TorchCommNCCLXTest, TestOptionsEnvironmentVariables) {
   setupCCAExpectations(0, 0, 1);
 
-  setOptionsEnvironmentVariables(false, 1.0); // false abort
+  setOptionsEnvironmentVariables(false, 1); // false abort, 1 second
 
   CommOptions options1;
   EXPECT_EQ(options1.abort_process_on_timeout_or_error, false);
   EXPECT_EQ(options1.timeout, std::chrono::milliseconds(1000));
 
-  setOptionsEnvironmentVariables(true, 1.5); // true abort
+  setOptionsEnvironmentVariables(true, 2); // true abort, 2 seconds
   CommOptions options2;
   EXPECT_EQ(options2.abort_process_on_timeout_or_error, true);
-  EXPECT_EQ(options2.timeout, std::chrono::milliseconds(1500));
+  EXPECT_EQ(options2.timeout, std::chrono::milliseconds(2000));
 }
 
 TEST_F(TorchCommNCCLXTest, UniqueCommDesc) {
@@ -122,6 +120,7 @@ TEST_F(TorchCommNCCLXTest, InitializationRank0GetUniqueId) {
 
   // Expect rank 0 to get unique ID and store it
   ncclUniqueId expected_id{};
+  // NOLINTNEXTLINE(facebook-hte-BadMemset)
   memset(&expected_id, 0x42, sizeof(expected_id)); // Fill with test pattern
 
   EXPECT_CALL(*nccl_mock_, getUniqueId(_))
@@ -168,6 +167,7 @@ TEST_F(TorchCommNCCLXTest, InitializationNonRank0ReadUniqueId) {
 
   // Pre-populate store with unique ID (as if rank 0 already stored it)
   ncclUniqueId expected_id{};
+  // NOLINTNEXTLINE(facebook-hte-BadMemset)
   memset(&expected_id, 0x42, sizeof(expected_id)); // Fill with test pattern
   std::vector<uint8_t> id_vec(sizeof(ncclUniqueId));
   memcpy(id_vec.data(), &expected_id, sizeof(expected_id));
@@ -227,8 +227,10 @@ TEST_F(TorchCommNCCLXTest, InitializationFailsWithInvalidDeviceId) {
 
     // Mock CUDA API to be called with device ID 0, since the boostrap
     // logic will assign a device ID in this case based on the rank.
+    // setDevice is called 3 times: once in the bootstrap constructor,
+    // once in init() post-bootstrap, and once in the watchdog thread.
     EXPECT_CALL(*cuda_mock_, setDevice(0))
-        .Times(2)
+        .Times(3)
         .WillRepeatedly(Return(cudaSuccess));
     EXPECT_CALL(*nccl_mock_, commInitRankConfig(_, 2, _, 0, _))
         .WillOnce(DoAll(
@@ -267,7 +269,8 @@ TEST_F(TorchCommNCCLXTest, InitializationFailsWithInvalidDeviceId) {
         comm->init(invalid_device, "test_name", default_options_),
         std::runtime_error);
 
-    comm->finalize();
+    // After a failed init, finalize should throw since we're not initialized
+    EXPECT_THROW(comm->finalize(), std::runtime_error);
   }
 }
 
@@ -359,7 +362,7 @@ TEST_F(TorchCommNCCLXTest, FinalizeWorkNotFinishedWaitsForCompletion) {
   EXPECT_NO_THROW(comm->finalize());
 }
 
-TEST_F(TorchCommNCCLXTest, FinalizeWorkErrorThrowsNCCLException) {
+TEST_F(TorchCommNCCLXTest, FinalizeWorkErrorThrowsNCCLXException) {
   // Setup CCA expectations
   // Register - 1 (init)
   // Deregister - 2 (finalize, destructor)
@@ -367,7 +370,7 @@ TEST_F(TorchCommNCCLXTest, FinalizeWorkErrorThrowsNCCLException) {
   setupCCAExpectations(1, 2, 1);
 
   // Test: if work errors because cudaEventQuery returns error, finalize throws
-  // NCCLException
+  // NCCLXException
   auto comm = createMockedTorchComm();
 
   cuda_mock_->setupDefaultBehaviors();
@@ -385,17 +388,17 @@ TEST_F(TorchCommNCCLXTest, FinalizeWorkErrorThrowsNCCLException) {
   auto& work_event = work_events_[0];
   setupWorkToError(work_event);
 
-  // Should throw NCCLException
+  // Should throw NCCLXException
   EXPECT_THROW(
       {
         try {
           comm->finalize();
-        } catch (const NCCLException& e) {
+        } catch (const NCCLXException& e) {
           EXPECT_EQ(e.getResult(), ncclInternalError);
           throw;
         }
       },
-      NCCLException);
+      NCCLXException);
 }
 
 TEST_F(TorchCommNCCLXTest, FinalizeWorkTimeoutThrowsRuntimeError) {
@@ -449,7 +452,7 @@ TEST_F(TorchCommNCCLXTest, WorkErrorCausesAbortDuringCollective) {
   setupCCAExpectations(1, 3, 1);
 
   // Test: if work errors, calling TorchCommNCCLX method calls commAbort and
-  // throws NCCLException
+  // throws NCCLXException
   auto comm = createMockedTorchComm();
 
   cuda_mock_->setupDefaultBehaviors();
@@ -468,22 +471,22 @@ TEST_F(TorchCommNCCLXTest, WorkErrorCausesAbortDuringCollective) {
 
   comm->waitTillError();
 
-  // Should throw NCCLException due to error
+  // Should throw NCCLXException due to error
   EXPECT_THROW(
       {
         try {
           auto work2 = comm->send(tensor, 1, true);
-        } catch (const NCCLException& e) {
+        } catch (const NCCLXException& e) {
           EXPECT_EQ(e.getResult(), ncclInternalError);
           throw;
         }
       },
-      NCCLException);
+      NCCLXException);
 
   // commDestroy should not be called since comm was aborted (set to nullptr)
   EXPECT_CALL(*nccl_mock_, commDestroy(_)).Times(0);
 
-  EXPECT_THROW(comm->finalize(), NCCLException);
+  EXPECT_THROW(comm->finalize(), NCCLXException);
 }
 
 TEST_F(TorchCommNCCLXTest, WorkDefaultTimeoutCausesAbortDuringCollective) {
@@ -494,7 +497,7 @@ TEST_F(TorchCommNCCLXTest, WorkDefaultTimeoutCausesAbortDuringCollective) {
   setupCCAExpectations(1, 3, 1);
 
   // Test: if work errors, calling TorchCommNCCLX method calls commAbort and
-  // throws NCCLException
+  // throws NCCLXException
   auto comm = createMockedTorchComm();
 
   cuda_mock_->setupDefaultBehaviors();
@@ -515,7 +518,7 @@ TEST_F(TorchCommNCCLXTest, WorkDefaultTimeoutCausesAbortDuringCollective) {
 
   comm->waitTillTimeout();
 
-  // Should throw NCCLException due to error
+  // Should throw NCCLXException due to error
   EXPECT_THROW(comm->send(tensor, 1, true), std::runtime_error);
 
   // commDestroy should not be called since comm was aborted (set to nullptr)
@@ -532,7 +535,7 @@ TEST_F(TorchCommNCCLXTest, WorkOperationTimeoutCausesAbortDuringCollective) {
   setupCCAExpectations(1, 3, 1);
 
   // Test: if work errors, calling TorchCommNCCLX method calls commAbort and
-  // throws NCCLException
+  // throws NCCLXException
   auto comm = createMockedTorchComm();
 
   cuda_mock_->setupDefaultBehaviors();
@@ -557,7 +560,7 @@ TEST_F(TorchCommNCCLXTest, WorkOperationTimeoutCausesAbortDuringCollective) {
 
   comm->waitTillTimeout();
 
-  // Should throw NCCLException due to error
+  // Should throw NCCLXException due to error
   SendOptions send_options3;
   EXPECT_THROW(comm->send(tensor, 1, true, send_options3), std::runtime_error);
 
@@ -713,7 +716,7 @@ TEST_F(
   comm->waitTillError();
 
   // Finalize should cause an error
-  EXPECT_THROW(comm->finalize(), NCCLException);
+  EXPECT_THROW(comm->finalize(), NCCLXException);
   EXPECT_FALSE(mock_hook_->isCommRegistered(comm.get()));
 }
 
@@ -841,10 +844,14 @@ TEST_F(
       .WillOnce(Return(ncclInvalidArgument));
 
   EXPECT_CALL(*nccl_mock_, getErrorString(ncclInvalidArgument))
-      .WillOnce(Return("Invalid argument"));
+      .WillRepeatedly(Return("Invalid argument"));
 
-  // Simulate memory allocation - should throw due to registration failure
-  EXPECT_THROW(allocator.regDeregMem(alloc_entry), std::runtime_error);
+  EXPECT_CALL(*nccl_mock_, getLastError(_))
+      .WillRepeatedly(Return("Invalid argument details"));
+
+  // Simulate memory allocation - should throw NCCLXException due to
+  // registration failure
+  EXPECT_THROW(allocator.regDeregMem(alloc_entry), NCCLXException);
 
   // Try again with successful registration
   EXPECT_CALL(
@@ -864,8 +871,9 @@ TEST_F(
   EXPECT_CALL(*nccl_mock_, commDeregister(_, reinterpret_cast<void*>(0x2000)))
       .WillOnce(Return(ncclInvalidArgument));
 
-  // Simulate memory deallocation - should throw due to deregistration failure
-  EXPECT_THROW(allocator.regDeregMem(dealloc_entry), std::runtime_error);
+  // Simulate memory deallocation - should throw NCCLXException due to
+  // deregistration failure
+  EXPECT_THROW(allocator.regDeregMem(dealloc_entry), NCCLXException);
 
   // Clean up
   setupNormalDestruction(*comm);
@@ -1441,11 +1449,11 @@ TEST_F(TorchCommNCCLXTest, AlltoallvDedupExecCombine) {
 }
 
 // ============================================================================
-// NCCLException TESTS
+// NCCLXException TESTS
 // ============================================================================
 
-TEST_F(TorchCommNCCLXTest, NCCLExceptionIncludesLastErrorString) {
-  // Test that NCCLException message includes the NCCL last error string
+TEST_F(TorchCommNCCLXTest, NCCLXExceptionIncludesLastErrorString) {
+  // Test that NCCLXException message includes the NCCL last error string
   // from getLastError() API
 
   nccl_mock_->setupDefaultBehaviors();
@@ -1460,7 +1468,7 @@ TEST_F(TorchCommNCCLXTest, NCCLExceptionIncludesLastErrorString) {
 
   // Create the exception
   ncclComm_t mock_comm = reinterpret_cast<ncclComm_t>(0x3000);
-  NCCLException exception(
+  NCCLXException exception(
       *nccl_mock_, "Test operation failed", ncclInternalError, mock_comm);
 
   // Verify the exception message contains both the error string and last error
@@ -1478,8 +1486,30 @@ TEST_F(TorchCommNCCLXTest, NCCLExceptionIncludesLastErrorString) {
   EXPECT_EQ(exception.getResult(), ncclInternalError);
 }
 
-TEST_F(TorchCommNCCLXTest, NCCLExceptionFromFailedSendIncludesLastError) {
-  // Test that when send() fails, the thrown NCCLException includes
+TEST_F(TorchCommNCCLXTest, NCCLXExceptionIncludesBacktrace) {
+  // Test that NCCLXException message includes a backtrace
+
+  nccl_mock_->setupDefaultBehaviors();
+
+  EXPECT_CALL(*nccl_mock_, getErrorString(ncclInternalError))
+      .WillOnce(Return("internal error"));
+  EXPECT_CALL(*nccl_mock_, getLastError(_)).WillOnce(Return("some error"));
+
+  ncclComm_t mock_comm = reinterpret_cast<ncclComm_t>(0x3000);
+  NCCLXException exception(
+      *nccl_mock_, "Test operation failed", ncclInternalError, mock_comm);
+
+  std::string what_message = exception.what();
+  EXPECT_TRUE(what_message.find("Backtrace:") != std::string::npos)
+      << "Exception message should contain 'Backtrace:' label";
+  EXPECT_TRUE(
+      what_message.find("NCCLXException") != std::string::npos ||
+      what_message.find("getStackTraceStr") != std::string::npos)
+      << "Backtrace should contain a recognizable frame: " << what_message;
+}
+
+TEST_F(TorchCommNCCLXTest, NCCLXExceptionFromFailedSendIncludesLastError) {
+  // Test that when send() fails, the thrown NCCLXException includes
   // the NCCL last error string
   setupRankAndSize(0, 2);
   setupCCAExpectations(1, 2, 1);
@@ -1507,10 +1537,10 @@ TEST_F(TorchCommNCCLXTest, NCCLExceptionFromFailedSendIncludesLastError) {
       {
         try {
           comm->send(tensor, 1, false);
-        } catch (const NCCLException& e) {
+        } catch (const NCCLXException& e) {
           std::string what_message = e.what();
           EXPECT_TRUE(
-              what_message.find("NCCL Send failed") != std::string::npos)
+              what_message.find("NCCLX Send failed") != std::string::npos)
               << "Exception should mention the failed operation";
           EXPECT_TRUE(what_message.find(last_error_detail) != std::string::npos)
               << "Exception should include the NCCL last error detail: "
@@ -1519,13 +1549,13 @@ TEST_F(TorchCommNCCLXTest, NCCLExceptionFromFailedSendIncludesLastError) {
           throw;
         }
       },
-      NCCLException);
+      NCCLXException);
 
   comm->finalize();
 }
 
-TEST_F(TorchCommNCCLXTest, NCCLExceptionFromFailedAllReduceIncludesLastError) {
-  // Test that when all_reduce() fails, the thrown NCCLException includes
+TEST_F(TorchCommNCCLXTest, NCCLXExceptionFromFailedAllReduceIncludesLastError) {
+  // Test that when all_reduce() fails, the thrown NCCLXException includes
   // the NCCL last error string
   setupRankAndSize(0, 2);
   setupCCAExpectations(1, 2, 1);
@@ -1552,10 +1582,10 @@ TEST_F(TorchCommNCCLXTest, NCCLExceptionFromFailedAllReduceIncludesLastError) {
       {
         try {
           comm->all_reduce(tensor, ReduceOp::SUM, false);
-        } catch (const NCCLException& e) {
+        } catch (const NCCLXException& e) {
           std::string what_message = e.what();
           EXPECT_TRUE(
-              what_message.find("NCCL AllReduce failed") != std::string::npos)
+              what_message.find("NCCLX AllReduce failed") != std::string::npos)
               << "Exception should mention the failed operation";
           EXPECT_TRUE(what_message.find(last_error_detail) != std::string::npos)
               << "Exception should include the NCCL last error detail: "
@@ -1564,11 +1594,9 @@ TEST_F(TorchCommNCCLXTest, NCCLExceptionFromFailedAllReduceIncludesLastError) {
           throw;
         }
       },
-      NCCLException);
+      NCCLXException);
 
   comm->finalize();
 }
 
-} // namespace test
-} // namespace comms
-} // namespace torch
+} // namespace torch::comms::test

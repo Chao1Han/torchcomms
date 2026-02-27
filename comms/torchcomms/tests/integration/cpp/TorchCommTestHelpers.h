@@ -2,6 +2,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <memory>
 #include <string>
 #include <tuple>
@@ -20,6 +21,36 @@ c10::intrusive_ptr<c10d::Store> createStore();
 void destroyStore(
     c10::intrusive_ptr<c10d::Store>&& store,
     const std::shared_ptr<torch::comms::TorchComm>& torchcomm);
+
+// Check if running on CPU (for skipping CUDA-specific tests)
+inline bool isRunningOnCPU() {
+  const char* test_device_env = std::getenv("TEST_DEVICE");
+  return test_device_env && std::string(test_device_env) == "cpu";
+}
+
+// Check if RMA tests should be skipped. RMA window ops require the ncclx
+// backend with CTran enabled. Returns empty string if tests should run, or a
+// non-empty skip reason string.
+inline std::string shouldSkipRmaTest() {
+  const auto envLower = [](const char* name) {
+    const char* val = std::getenv(name);
+    std::string s(val ? val : "");
+    std::transform(s.begin(), s.end(), s.begin(), ::tolower);
+    return s;
+  };
+  // Match NCCL's env2bool: y/yes/t/true/1 are truthy (case-insensitive)
+  const auto envBool = [&envLower](const char* name) {
+    const auto s = envLower(name);
+    return s == "1" || s == "y" || s == "yes" || s == "t" || s == "true";
+  };
+  if (envLower("TEST_BACKEND") != "ncclx") {
+    return "RMA window ops require ncclx backend";
+  }
+  if (!envBool("NCCL_CTRAN_ENABLE")) {
+    return "RMA window ops require ctran (NCCL_CTRAN_ENABLE not set)";
+  }
+  return "";
+}
 
 // Convert a tensor to a string representation with nested brackets for each
 // dimension. Supports any N-dimensional tensor.
@@ -61,8 +92,11 @@ class TorchCommTestWrapper {
   }
 
   virtual c10::Device getDevice() {
-    // We don't need to pass the exact device index here.  TorchComm will figure
-    // out based on our local rank
+    if (isRunningOnCPU()) {
+      return c10::Device(c10::DeviceType::CPU);
+    }
+    // For CUDA backends, TorchComm will figure out the device index based on
+    // local rank
     return c10::Device(c10::DeviceType::CUDA);
   }
 

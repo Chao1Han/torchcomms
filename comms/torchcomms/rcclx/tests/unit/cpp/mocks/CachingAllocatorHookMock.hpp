@@ -7,17 +7,11 @@
 
 #include "comms/torchcomms/rcclx/TorchCommRCCLXCCA.hpp"
 
-namespace torch {
-namespace comms {
-namespace test {
+namespace torch::comms::test {
 
 class CachingAllocatorHookMock : public CachingAllocatorHookImpl {
  public:
-  MOCK_METHOD(
-      void,
-      regDeregMem,
-      (const c10::hip::HIPCachingAllocator::TraceEntry& entry),
-      (override));
+  MOCK_METHOD(void, regDeregMem, (const TraceEntry& entry), (override));
   MOCK_METHOD(void, registerComm, (TorchCommRCCLX * comm), (override));
   MOCK_METHOD(void, deregisterComm, (TorchCommRCCLX * comm), (override));
   MOCK_METHOD(void, clear, (), (override));
@@ -36,6 +30,4 @@ class CachingAllocatorHookMock : public CachingAllocatorHookImpl {
   std::unordered_set<void*> registered_comms_;
 };
 
-} // namespace test
-} // namespace comms
-} // namespace torch
+} // namespace torch::comms::test

@@ -5,9 +5,9 @@
 #include <comms/torchcomms/TorchWork.hpp>
 #include <torch/csrc/distributed/c10d/Store.hpp> // @manual=//caffe2:torch-cpp-cpu
 
-namespace torch {
-namespace comms {
+namespace torch::comms {
 
+namespace {
 class DummyTorchCommWindow : public TorchCommWindow {
  public:
   void tensor_register(const at::Tensor& tensor) override {
@@ -52,7 +52,12 @@ class DummyTorchCommWindow : public TorchCommWindow {
     (void)peerRank;
     return nullptr;
   }
+
+  std::shared_ptr<TorchCommWindow> clone() override {
+    return std::make_shared<DummyTorchCommWindow>();
+  }
 };
+} // namespace
 
 TorchCommDummy::TorchCommDummy()
     : initialized_(false), device_(at::kCPU), rank_(0), size_(1) {}
@@ -236,8 +241,12 @@ c10::intrusive_ptr<TorchWork> TorchCommDummy::gather(
   return c10::make_intrusive<TorchWorkCompleted>();
 }
 
-std::shared_ptr<TorchCommWindow> TorchCommDummy::new_window() {
+std::shared_ptr<TorchCommWindow> TorchCommDummy::new_window(
+    const std::optional<at::Tensor>& tensor) {
   auto win = std::make_shared<DummyTorchCommWindow>();
+  if (tensor.has_value()) {
+    win->tensor_register(tensor.value());
+  }
   return win;
 }
 
@@ -271,5 +280,4 @@ class DummyRegistration {
 static const DummyRegistration registration{};
 } // namespace
 
-} // namespace comms
-} // namespace torch
+} // namespace torch::comms

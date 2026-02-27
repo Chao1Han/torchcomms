@@ -7,9 +7,7 @@
 
 #include "comms/torchcomms/rccl/HipApi.hpp"
 
-namespace torch {
-namespace comms {
-namespace test {
+namespace torch::comms::test {
 
 class HipMock : public HipApi {
  public:
@@ -38,7 +36,7 @@ class HipMock : public HipApi {
       (override));
   MOCK_METHOD(
       hipStream_t,
-      getCurrentHIPStreamMasqueradingAsCUDA,
+      getCurrentCUDAStream,
       (int device_index),
       (override));
   MOCK_METHOD(hipError_t, streamSynchronize, (hipStream_t stream), (override));
@@ -81,6 +79,4 @@ class HipMock : public HipApi {
   void setupDefaultBehaviors();
 };
 
-} // namespace test
-} // namespace comms
-} // namespace torch
+} // namespace torch::comms::test

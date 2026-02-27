@@ -18,9 +18,7 @@
 #include "comms/torchcomms/ncclx/tests/unit/cpp/mocks/CudaMock.hpp"
 #include "comms/torchcomms/ncclx/tests/unit/cpp/mocks/NcclxMock.hpp"
 
-namespace torch {
-namespace comms {
-namespace test {
+namespace torch::comms::test {
 
 using ::testing::_;
 using ::testing::DoAll;
@@ -41,7 +39,7 @@ struct WorkEvent {
 
 class TorchCommNCCLXTest : public ::testing::Test {
  public:
-  // Wrapper function to access private getTimeout() method
+  // Wrapper function to access getTimeout() method
   // Since TorchCommNCCLXTest is a friend class of TorchWorkNCCLX,
   // it can access private members
   std::chrono::milliseconds getWorkTimeout(TorchWorkNCCLX* work) {
@@ -55,7 +53,9 @@ class TorchCommNCCLXTest : public ::testing::Test {
 
   void setupRankAndSize(int rank, int size);
 
-  void setOptionsEnvironmentVariables(bool abort_on_error, float timeout_secs);
+  void setOptionsEnvironmentVariables(
+      bool abort_on_error,
+      uint64_t timeout_secs);
 
   class TestTorchCommNCCLX : public TorchCommNCCLX {
    public:
@@ -82,6 +82,10 @@ class TorchCommNCCLXTest : public ::testing::Test {
 
     cudaEvent_t getAsyncDependencyEvent() const {
       return dependency_event_;
+    }
+
+    void checkGraphEvents() {
+      TorchCommNCCLX::checkGraphEvents();
     }
   };
 
@@ -121,6 +125,4 @@ class TorchCommNCCLXTest : public ::testing::Test {
   CachingAllocatorHookMock* mock_hook_{};
 };
 
-} // namespace test
-} // namespace comms
-} // namespace torch
+} // namespace torch::comms::test

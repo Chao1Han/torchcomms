@@ -15,33 +15,55 @@
 
 #include <ATen/ATen.h>
 #include <cuda_runtime.h> // @manual=third-party//cuda:cuda-lazy
+#include <glog/logging.h>
 #include <torch/csrc/distributed/c10d/Store.hpp> // @manual=//caffe2:torch-cpp
 
 #include "comms/torchcomms/TorchComm.hpp"
 #include "comms/torchcomms/TorchCommBackend.hpp"
 #include "comms/torchcomms/TorchCommBatch.hpp"
-#include "comms/torchcomms/TorchCommTracing.hpp"
-#include "comms/torchcomms/device/CudaApi.hpp"
+#include "comms/torchcomms/device/cuda/CudaApi.hpp"
 #include "comms/torchcomms/nccl/NcclApi.hpp"
 #include "comms/torchcomms/nccl/TorchWorkNCCL.hpp"
 
-namespace torch {
-namespace comms {
+namespace torch::comms {
 
 constexpr size_t kDefaultMaxEventPoolSize = 1000;
 
 // Custom exception class for better error handling
 class NCCLException : public std::exception {
  public:
-  NCCLException(NcclApi& api, const std::string& message, ncclResult_t result);
+  NCCLException(
+      NcclApi& api,
+      const std::string& message,
+      ncclResult_t result,
+      ncclComm_t comm);
 
   const char* what() const noexcept override;
-  ncclResult_t getResult() const;
+  [[nodiscard]] ncclResult_t getResult() const noexcept;
 
  private:
   std::string message_;
   ncclResult_t result_;
 };
+
+#define NCCL_CHECK(nccl_api, nccl_comm, call, err_str)            \
+  do {                                                            \
+    ncclResult_t status = call;                                   \
+    if (status != ncclSuccess) {                                  \
+      throw NCCLException(*nccl_api, err_str, status, nccl_comm); \
+    }                                                             \
+  } while (0)
+
+// Ignore variant for use in destructors - logs errors instead of throwing
+#define NCCL_CHECK_IGNORE(nccl_api, call, err_str)                         \
+  do {                                                                     \
+    ncclResult_t status = call;                                            \
+    if (status != ncclSuccess) {                                           \
+      LOG(ERROR) << "[TC] " << err_str << ": "                             \
+                 << nccl_api->getErrorString(status) << " at " << __FILE__ \
+                 << ":" << __LINE__;                                       \
+    }                                                                      \
+  } while (0)
 
 class TorchCommNCCL : public TorchCommBackend,
                       public std::enable_shared_from_this<TorchCommNCCL> {
@@ -211,7 +233,7 @@ class TorchCommNCCL : public TorchCommBackend,
 
  protected:
   // Event management for friend classes
-  cudaEvent_t getEvent();
+  [[nodiscard]] cudaEvent_t getEvent();
   void returnEvent(cudaEvent_t event);
   void abortNcclComm();
 
@@ -239,7 +261,12 @@ class TorchCommNCCL : public TorchCommBackend,
   c10::intrusive_ptr<TorchWorkNCCL> createWork(
       cudaStream_t stream,
       std::chrono::milliseconds timeout,
-      const std::vector<at::Tensor>& inputTensors);
+      const std::vector<at::Tensor>& inputTensors = {});
+
+  c10::intrusive_ptr<TorchWorkNCCL> createWork(
+      cudaStream_t stream,
+      std::chrono::milliseconds timeout,
+      const at::Tensor& inputTensor);
 
  private:
   // Helper that automatically cleans up premul sums.
@@ -256,8 +283,31 @@ class TorchCommNCCL : public TorchCommBackend,
     RedOpRAII() = delete;
     RedOpRAII(const RedOpRAII&) = delete;
     RedOpRAII& operator=(const RedOpRAII&) = delete;
-    RedOpRAII(RedOpRAII&& tmp) = delete;
-    RedOpRAII& operator=(RedOpRAII&&) = delete;
+
+    RedOpRAII(RedOpRAII&& other) noexcept
+        : ncclRedOp_(other.ncclRedOp_),
+          comm_(other.comm_),
+          nccl_api_(std::move(other.nccl_api_)) {
+      other.comm_ = nullptr; // Prevent destructor from destroying the op
+    }
+
+    RedOpRAII& operator=(RedOpRAII&& other) noexcept {
+      if (this != &other) {
+        // Destroy current op if we own one
+        if (comm_ && nccl_api_) {
+          NCCL_CHECK_IGNORE(
+              nccl_api_,
+              nccl_api_->redOpDestroy(ncclRedOp_, comm_),
+              "failed to destroy NCCL reduction operation");
+        }
+        ncclRedOp_ = other.ncclRedOp_;
+        comm_ = other.comm_;
+        nccl_api_ = std::move(other.nccl_api_);
+        other.comm_ = nullptr; // Prevent destructor from destroying the op
+      }
+      return *this;
+    }
+
     ~RedOpRAII();
 
     operator ncclRedOp_t() const {
@@ -282,7 +332,14 @@ class TorchCommNCCL : public TorchCommBackend,
 
     RegistrationHandle(const RegistrationHandle&) = delete;
     RegistrationHandle& operator=(const RegistrationHandle&) = delete;
-    RegistrationHandle& operator=(RegistrationHandle&&) = delete;
+
+    RegistrationHandle& operator=(RegistrationHandle&& other) noexcept {
+      if (this != &other) {
+        regHandle = other.regHandle;
+        other.regHandle = nullptr;
+      }
+      return *this;
+    }
 
     ~RegistrationHandle() = default;
   };
@@ -348,7 +405,6 @@ class TorchCommNCCL : public TorchCommBackend,
   std::condition_variable timeout_cv_;
   std::mutex timeout_mutex_;
 
-  std::shared_ptr<TorchCommTracing> tracing_;
   bool high_priority_stream_{false};
   std::string name_;
 
@@ -376,5 +432,4 @@ class TorchCommNCCL : public TorchCommBackend,
   friend class TorchWorkNCCLQueueCommTest;
 };
 
-} // namespace comms
-} // namespace torch
+} // namespace torch::comms

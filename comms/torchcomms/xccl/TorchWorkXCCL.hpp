@@ -11,10 +11,9 @@
 #include <ATen/ATen.h>
 #include "comms/torchcomms/TorchCommTracing.hpp"
 #include "comms/torchcomms/TorchWork.hpp"
-#include "comms/torchcomms/device/XpuApi.hpp"
+#include "comms/torchcomms/device/xpu/XpuApi.hpp"
 
-namespace torch {
-namespace comms {
+namespace torch::comms {
 
 // Forward declaration
 class TorchCommXCCL;
@@ -45,8 +44,10 @@ class TorchWorkXCCL : public TorchWork {
   TorchWorkXCCL& operator=(TorchWorkXCCL&&) = delete;
 
   // Override virtual functions from TorchWork
-  bool isCompleted() override;
   void wait() override;
+  std::chrono::milliseconds getTimeout() const override {
+    return timeout_ms_;
+  }
 
  protected:
   void recordStart();
@@ -59,9 +60,6 @@ class TorchWorkXCCL : public TorchWork {
   // Check the status of the work object
   WorkStatus checkStatus();
 
-  std::chrono::milliseconds getTimeout() const {
-    return timeout_ms_;
-  }
   std::vector<at::Tensor> inputTensors_;
 
   std::shared_ptr<TorchCommXCCL> comm_;
@@ -95,5 +93,4 @@ class TorchWorkXCCLQueue {
   std::recursive_mutex work_queues_mutex_;
 };
 
-} // namespace comms
-} // namespace torch
+} // namespace torch::comms

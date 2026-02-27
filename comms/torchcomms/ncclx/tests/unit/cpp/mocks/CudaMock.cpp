@@ -8,13 +8,13 @@ using ::testing::DoAll;
 using ::testing::Return;
 using ::testing::SetArgPointee;
 
-namespace torch {
-namespace comms {
-namespace test {
+namespace torch::comms::test {
 
 void CudaMock::setupDefaultBehaviors() {
   // Device management - return success by default
   ON_CALL(*this, setDevice(_)).WillByDefault(Return(cudaSuccess));
+  ON_CALL(*this, getDevice(_))
+      .WillByDefault(DoAll(SetArgPointee<0>(0), Return(cudaSuccess)));
 
   ON_CALL(*this, getDeviceCount(_))
       .WillByDefault(DoAll(SetArgPointee<0>(1), Return(cudaSuccess)));
@@ -68,6 +68,10 @@ void CudaMock::setupDefaultBehaviors() {
   ON_CALL(*this, graphRetainUserObject(_, _, _, _))
       .WillByDefault(Return(cudaSuccess));
 
+  ON_CALL(*this, userObjectRelease(_, _)).WillByDefault(Return(cudaSuccess));
+
+  ON_CALL(*this, launchHostFunc(_, _, _)).WillByDefault(Return(cudaSuccess));
+
   ON_CALL(*this, streamGetCaptureInfo_v2(_, _, _, _, _, _))
       .WillByDefault(DoAll(
           SetArgPointee<1>(cudaStreamCaptureStatusNone),
@@ -86,6 +90,8 @@ void CudaMock::setupDefaultBehaviors() {
 
   ON_CALL(*this, free(_)).WillByDefault(Return(cudaSuccess));
 
+  ON_CALL(*this, memcpy(_, _, _, _)).WillByDefault(Return(cudaSuccess));
+
   ON_CALL(*this, memcpyAsync(_, _, _, _, _)).WillByDefault(Return(cudaSuccess));
 
   // Event management - return success by default
@@ -103,6 +109,9 @@ void CudaMock::setupDefaultBehaviors() {
 
   ON_CALL(*this, eventRecord(_, _)).WillByDefault(Return(cudaSuccess));
 
+  ON_CALL(*this, eventRecordWithFlags(_, _, _))
+      .WillByDefault(Return(cudaSuccess));
+
   ON_CALL(*this, eventQuery(_)).WillByDefault(Return(cudaSuccess));
 
   // Error handling - return default error strings
@@ -117,6 +126,4 @@ void CudaMock::reset() {
   setupDefaultBehaviors();
 }
 
-} // namespace test
-} // namespace comms
-} // namespace torch
+} // namespace torch::comms::test

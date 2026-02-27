@@ -6,8 +6,7 @@
 #include <comms/torchcomms/TorchWork.hpp>
 #include <vector>
 
-namespace torch {
-namespace comms {
+namespace torch::comms {
 
 class TorchCommDummy : public TorchCommBackend {
  public:
@@ -129,8 +128,9 @@ class TorchCommDummy : public TorchCommBackend {
       bool async_op,
       const GatherOptions& options = {}) override;
 
-  // Window & One-sidede Operations
-  std::shared_ptr<TorchCommWindow> new_window() override;
+  // Window & One-sided Operations
+  std::shared_ptr<TorchCommWindow> new_window(
+      const std::optional<at::Tensor>& tensor = std::nullopt) override;
 
   // Communicator Management
   std::shared_ptr<TorchCommBackend> split(
@@ -141,6 +141,11 @@ class TorchCommDummy : public TorchCommBackend {
   const CommOptions& getOptions() const override;
   const at::Device& getDevice() const override;
 
+  // Test helper to trigger abort hooks (for testing purposes only)
+  void triggerAbort() {
+    runAbortHooks();
+  }
+
  private:
   bool initialized_;
   at::Device device_;
@@ -150,5 +155,4 @@ class TorchCommDummy : public TorchCommBackend {
   std::string name_;
 };
 
-} // namespace comms
-} // namespace torch
+} // namespace torch::comms

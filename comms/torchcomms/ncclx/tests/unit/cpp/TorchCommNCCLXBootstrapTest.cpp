@@ -19,9 +19,7 @@ using ::testing::NiceMock;
 using ::testing::Return;
 using ::testing::SetArgPointee;
 
-namespace torch {
-namespace comms {
-namespace test {
+namespace torch::comms::test {
 
 constexpr std::chrono::seconds kTimeout{60};
 
@@ -101,6 +99,7 @@ TEST_F(TorchCommNCCLXBootstrapTest, GetRankAndSizeFromEnvironment) {
 
   // Set up store with unique ID (as if rank 0 already stored it)
   ncclUniqueId expected_id{};
+  // NOLINTNEXTLINE(facebook-hte-BadMemset)
   memset(&expected_id, 0x42, sizeof(expected_id));
   std::vector<uint8_t> id_vec(sizeof(ncclUniqueId));
   memcpy(id_vec.data(), &expected_id, sizeof(expected_id));
@@ -130,6 +129,7 @@ TEST_F(TorchCommNCCLXBootstrapTest, ExchangeUniqueIdRank0) {
 
   // Rank 0 should generate unique ID and store it
   ncclUniqueId expected_id{};
+  // NOLINTNEXTLINE(facebook-hte-BadMemset)
   memset(&expected_id, 0x42, sizeof(expected_id));
 
   EXPECT_CALL(*nccl_mock_, getUniqueId(_))
@@ -158,6 +158,7 @@ TEST_F(TorchCommNCCLXBootstrapTest, ExchangeUniqueIdNonRank0) {
 
   // Pre-populate store with unique ID (as if rank 0 already stored it)
   ncclUniqueId expected_id{};
+  // NOLINTNEXTLINE(facebook-hte-BadMemset)
   memset(&expected_id, 0x42, sizeof(expected_id));
   std::vector<uint8_t> id_vec(sizeof(ncclUniqueId));
   memcpy(id_vec.data(), &expected_id, sizeof(expected_id));
@@ -210,6 +211,7 @@ TEST_F(TorchCommNCCLXBootstrapTest, CreateNcclCommInitRankConfigFailure) {
   auto bootstrap = createBootstrap();
 
   ncclUniqueId expected_id{};
+  // NOLINTNEXTLINE(facebook-hte-BadMemset)
   memset(&expected_id, 0x42, sizeof(expected_id));
 
   EXPECT_CALL(*nccl_mock_, getUniqueId(_))
@@ -274,6 +276,7 @@ TEST_F(TorchCommNCCLXBootstrapTest, CreateNcclCommWithNullStore) {
       nullptr, device_, nccl_mock_, cuda_mock_, kTimeout);
 
   ncclUniqueId expected_id{};
+  // NOLINTNEXTLINE(facebook-hte-BadMemset)
   memset(&expected_id, 0x42, sizeof(expected_id));
 
   EXPECT_CALL(*nccl_mock_, getUniqueId(_))
@@ -301,6 +304,7 @@ TEST_F(TorchCommNCCLXBootstrapTest, CleanupTCPStoreBarrierFailure) {
       nullptr, device_, nccl_mock_, cuda_mock_, kTimeout);
 
   ncclUniqueId expected_id{};
+  // NOLINTNEXTLINE(facebook-hte-BadMemset)
   memset(&expected_id, 0x42, sizeof(expected_id));
 
   EXPECT_CALL(*nccl_mock_, getUniqueId(_))
@@ -322,6 +326,4 @@ TEST_F(TorchCommNCCLXBootstrapTest, CleanupTCPStoreBarrierFailure) {
   EXPECT_NO_THROW(bootstrap->createNcclComm("test_comm"));
 }
 
-} // namespace test
-} // namespace comms
-} // namespace torch
+} // namespace torch::comms::test

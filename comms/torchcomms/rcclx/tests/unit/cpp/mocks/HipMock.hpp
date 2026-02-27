@@ -7,9 +7,7 @@
 
 #include "comms/torchcomms/rcclx/HipApi.hpp"
 
-namespace torch {
-namespace comms {
-namespace test {
+namespace torch::comms::test {
 
 class HipMock : public HipApi {
  public:
@@ -36,9 +34,11 @@ class HipMock : public HipApi {
       streamWaitEvent,
       (hipStream_t stream, hipEvent_t event, unsigned int flags),
       (override));
+  // Note: Uses getCurrentCUDAStream because tests go through hipify which
+  // transforms getCurrentHIPStreamMasqueradingAsCUDA to getCurrentCUDAStream
   MOCK_METHOD(
       hipStream_t,
-      getCurrentHIPStreamMasqueradingAsCUDA,
+      getCurrentCUDAStream,
       (int device_index),
       (override));
   MOCK_METHOD(hipError_t, streamSynchronize, (hipStream_t stream), (override));
@@ -81,6 +81,4 @@ class HipMock : public HipApi {
   void setupDefaultBehaviors();
 };
 
-} // namespace test
-} // namespace comms
-} // namespace torch
+} // namespace torch::comms::test

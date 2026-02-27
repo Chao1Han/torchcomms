@@ -25,8 +25,10 @@
 #include <optional>
 
 #include "comms/ctran/CtranComm.h"
+#include "comms/utils/colltrace/AlgoStats.h"
 #include "comms/utils/colltrace/CollTraceInterface.h"
 #include "comms/ctran/memory/SlabAllocator.h"
+#include "meta/algoconf/InfoExt.h"
 #include "comms/ctran/memory/memCacheAllocator.h"
 #include "comms/utils/commSpecs.h"
 
@@ -250,6 +252,8 @@ struct ncclTaskColl {
   void* collApiEventHandle;
   void* eventHandle;
   uint8_t nChannels;
+  // [META:INFO_EXT] Extension for per-comm algorithm/protocol override
+  std::optional<ncclx::algoconf::ncclInfoExt> ext;
 };
 
 struct ncclTaskP2p {
@@ -726,6 +730,7 @@ struct ncclComm {
   struct CommLogData logMetaData;
   std::shared_ptr<CollTrace> collTrace;
   std::shared_ptr<meta::comms::colltrace::ICollTrace> newCollTrace;
+  std::unique_ptr<meta::comms::colltrace::AlgoStats> algoStats;
   std::shared_ptr<ctran::bootstrap::IBootstrap> ctranBootstrap;
   std::shared_ptr<ncclx::memory::memCacheAllocator> memCache{nullptr};
   std::vector<std::string> connSetupBufKeys;
@@ -734,6 +739,10 @@ struct ncclComm {
   // This is the only bridge between ctran and baseline code
   bool useCtran_{false}; // Ctran per-communicator control; set at init entry functions
   std::unique_ptr<CtranComm> ctranComm_;
+
+  // [META:PAT_AVG] per-communicator control; set at init entry functions
+  // When enabled, forces PAT algorithm with ncclDevPatSumPostDiv for ReduceScatter with ncclAvg
+  bool usePatAvg_{false};
 
   uint64_t endMagic;
 };

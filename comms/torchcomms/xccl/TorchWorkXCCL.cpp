@@ -3,8 +3,7 @@
 #include "comms/torchcomms/TorchCommLogging.hpp"
 #include "comms/torchcomms/xccl/TorchCommXCCL.hpp"
 
-namespace torch {
-namespace comms {
+namespace torch::comms {
 
 TorchWorkXCCL::TorchWorkXCCL(
     std::shared_ptr<TorchCommXCCL> comm,
@@ -47,10 +46,6 @@ void TorchWorkXCCL::recordEnd() {
       comm_->getXpuApi(),
       comm_->getXpuApi()->eventRecord(end_event_, stream_),
       "Failed to record end event");
-}
-
-bool TorchWorkXCCL::isCompleted() {
-  return state_ == WorkStatus::COMPLETED;
 }
 
 TorchWorkXCCL::WorkStatus TorchWorkXCCL::checkStatus() {
@@ -136,5 +131,4 @@ void TorchWorkXCCL::wait() {
       comm_->getXpuApi()->streamWaitEvent(current_stream, end_event_, 0),
       "Failed to make stream wait for event");
 }
-} // namespace comms
-} // namespace torch
+} // namespace torch::comms

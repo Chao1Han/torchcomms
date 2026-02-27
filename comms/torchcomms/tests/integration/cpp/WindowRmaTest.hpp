@@ -22,7 +22,8 @@ class WindowRmaTest : public ::testing::TestWithParam<
       bool async_op,
       bool async_signal);
 
-  bool checkIfSkip();
+  // Test function for new_window with optional tensor argument
+  void testWindowPutWithTensorInNewWindow(int count, at::ScalarType dtype);
 
  protected:
   std::unique_ptr<TorchCommTestWrapper> createWrapper();

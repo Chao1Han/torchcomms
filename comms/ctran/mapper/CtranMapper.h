@@ -16,9 +16,9 @@
 #include "comms/ctran/colltrace/MapperTrace.h"
 #include "comms/ctran/gpe/CtranGpe.h"
 #include "comms/ctran/gpe/CtranGpeDev.h"
-#include "comms/ctran/mapper/CtranMapperImpl.h"
 #include "comms/ctran/mapper/CtranMapperTypes.h"
 #include "comms/ctran/profiler/Profiler.h"
+#include "comms/ctran/regcache/IpcRegCache.h"
 #include "comms/ctran/regcache/RegCache.h"
 #include "comms/ctran/utils/Checks.h"
 #include "comms/ctran/utils/CtranPerf.h"
@@ -108,6 +108,8 @@ class CtranMapper {
       bool allowDynamic = true);
 
   DevMemType segmentType(void* segHdl);
+
+  const void* segmentBuf(void* segHdl);
 
   /* Deregister a dynamic registration.
    * Input arguments:
@@ -886,10 +888,6 @@ class CtranMapper {
     }
   }
 
-  // Dump exported registration cache, for testing only
-  std::unordered_map<ctran::regcache::RegElem*, std::unordered_set<int>>
-  dumpExportRegCache() const;
-
  protected:
   template <typename PerfConfig = DefaultPerfCollConfig>
   inline commResult_t progress() {
@@ -901,11 +899,11 @@ class CtranMapper {
       FB_COMMCHECK(this->ctranTcpDm->progress());
     }
 
-    // Check if any posted CB_CTRL requests are completed and cleanup
+    // Check if any posted IPC release requests are completed and cleanup
     for (auto it = this->postedCbCtrlReqs_.begin();
          it != this->postedCbCtrlReqs_.end();) {
       auto& req = *it;
-      if (req->checkComplete()) {
+      if (req->completed.load()) {
         it = this->postedCbCtrlReqs_.erase(it);
       } else {
         it++;
@@ -1082,10 +1080,13 @@ class CtranMapper {
     }
 
     if (backend == CtranMapperBackend::NVL) {
-      FB_COMMCHECK(CtranNvl::exportMem(buf, regElem->nvlRegElem, msg));
+      msg.setType(ControlMsgType::NVL_EXPORT_MEM);
+      const std::string peerId = comm->statex_->gPid(rank);
+      FB_COMMCHECK(
+          ctran::IpcRegCache::getInstance()->exportMem(
+              buf, regElem->ipcRegElem, peerId, msg.ipcDesc));
 
-      // Record the exported remote rank to notify at deregistration
-      exportRegCache_.wlock()->record(regElem, rank);
+      // Export tracking now happens inside IpcRegCache::exportMem
 
     } else if (backend == CtranMapperBackend::IB) {
       FB_COMMCHECK(CtranIb::exportMem(buf, regElem->ibRegElem, msg));
@@ -1121,7 +1122,7 @@ class CtranMapper {
         remKey->backend = CtranMapperBackend::IB;
         FB_COMMCHECK(CtranIb::importMem(buf, &(remKey->ibKey), msg));
         break;
-      case ControlMsgType::NVL_EXPORT_MEM:
+      case ControlMsgType::NVL_EXPORT_MEM: {
         if (!this->ctranNvl) {
           CLOGF(
               ERR,
@@ -1130,9 +1131,17 @@ class CtranMapper {
           return commInternalError;
         }
         remKey->backend = CtranMapperBackend::NVL;
+        const std::string peerId = comm->statex_->gPid(rank);
         FB_COMMCHECK(
-            this->ctranNvl->importMem(buf, &(remKey->nvlKey), rank, msg));
+            ctran::IpcRegCache::getInstance()->importMem(
+                peerId,
+                msg.ipcDesc,
+                comm->statex_->cudaDev(),
+                buf,
+                &(remKey->nvlKey),
+                &this->logMetaData_));
         break;
+      }
       default:
         CLOGF(
             ERR,
@@ -1147,7 +1156,7 @@ class CtranMapper {
       ctran::regcache::RegElem* regElem,
       int rank) {
     if (this->ctranNvl && this->ctranNvl->isSupported(rank) &&
-        regElem->nvlRegElem) {
+        regElem->ipcRegElem) {
       return CtranMapperBackend::NVL;
     } else if (this->ctranIb && regElem->ibRegElem) {
       return CtranMapperBackend::IB;
@@ -1924,56 +1933,14 @@ class CtranMapper {
   std::vector<bool> enableBackends_{
       std::vector<bool>(CtranMapperBackend::NUM_BACKENDS, false)};
 
-  // Lightweight request object to track mapper internal callback ctrl msgs
-  class CbCtrlRequest {
-   public:
-    CbCtrlRequest(int peer, CtranMapperBackend backend)
-        : peer(peer), backend(backend) {
-      if (backend == CtranMapperBackend::IB) {
-        ibReq = CtranIbRequest();
-      } else if (backend == CtranMapperBackend::SOCKET) {
-        sockReq = CtranSocketRequest();
-      } else if (backend == CtranMapperBackend::TCPDM) {
-        tcpDmReq = ctran::CtranTcpDmRequest();
-      } else {
-        CLOGF(ERR, "CTRAN-MAPPER: Unsupported backend {}", backend);
-        FB_COMMCHECKTHROW_EX_NOCOMM(commInternalError);
-      }
-    };
-    ~CbCtrlRequest() {};
-    bool checkComplete() {
-      if (backend == CtranMapperBackend::IB) {
-        return ibReq.isComplete();
-      } else if (backend == CtranMapperBackend::SOCKET) {
-        return sockReq.isComplete();
-      } else if (backend == CtranMapperBackend::TCPDM) {
-        return tcpDmReq.isComplete();
-      }
-      return false;
-    }
-
-    int peer{-1};
-    union {
-      CtranIbRequest ibReq;
-      CtranSocketRequest sockReq;
-      ctran::CtranTcpDmRequest tcpDmReq;
-    };
-    CtranMapperBackend backend;
-    ControlMsg msg;
-  };
-
-  // List of outstanding internal callback ctrl message requests to be processed
-  // when polling progress. The internal msg buffer is used to hold the content
-  // and may be queued at VC layer. Thus, we need temporarily hold the request
+  // List of outstanding internal IPC release requests to be processed
+  // when polling progress. We need to temporarily hold the request
   // instance and erase after completion.
-  std::deque<std::unique_ptr<CbCtrlRequest>> postedCbCtrlReqs_;
+  std::deque<std::unique_ptr<ctran::regcache::IpcReqCb>> postedCbCtrlReqs_;
 
-  // Record remote ranks that each nvlRegElem has exported to.
-  // - For each remote rank, the local rank will send RELEASE_MEM ctrlmsg to
-  //   the remote rank at deregMem.
-  // - The export cache is maintained per communicator in order to ensure a
-  //   valid backend to send RELEASE_MEM ctrlmsg.
-  folly::Synchronized<ctran::ExportRegCache> exportRegCache_;
+  // AllGather IPC server addresses from all ranks via bootstrap and update
+  // IpcRegCache with the gathered addresses.
+  commResult_t allGatherIpcServerAddrs();
 
   CtranComm* comm{nullptr};
 };

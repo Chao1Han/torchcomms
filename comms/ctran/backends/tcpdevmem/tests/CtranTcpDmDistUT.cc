@@ -17,6 +17,7 @@
 #include "comms/ctran/backends/tcpdevmem/CtranTcpDm.h"
 #include "comms/ctran/backends/tcpdevmem/CtranTcpDmSingleton.h"
 #include "comms/ctran/utils/CudaWrap.h"
+#include "comms/ctran/utils/Exception.h"
 #include "comms/testinfra/TestUtils.h"
 #include "comms/testinfra/TestsDistUtils.h"
 #include "comms/utils/cvars/nccl_cvars.h"
@@ -54,7 +55,9 @@ class CtranTcpTest : public NcclxBaseTest {
     try {
       this->ctranTcpDm =
           std::make_unique<CtranTcpDm>(this->comm, this->ctrlMgr.get());
-    } catch (const std::runtime_error& e) {
+    } catch (const ctran::utils::Exception&) {
+      GTEST_SKIP() << "TCPDM backend not enabled. Skip test";
+    } catch (const std::runtime_error&) {
       GTEST_SKIP() << "TCPDM backend not enabled. Skip test";
     }
   }

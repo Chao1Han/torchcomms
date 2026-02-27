@@ -1,26 +1,22 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 
 #include "TorchCommNCCLXPersistentRequest.hpp"
+#include "NcclxApi.hpp"
 #include "TorchCommNCCLX.hpp"
 #include "comms/torchcomms/TorchCommLogging.hpp"
 
-namespace torch {
-namespace comms {
+namespace torch::comms {
 TorchCommNCCLXPersistentRequest::TorchCommNCCLXPersistentRequest(
     std::shared_ptr<TorchCommNCCLX> comm,
     void* hdl,
     std::optional<cudaStream_t> stream)
     : comm_(std::move(comm)), hdl_(hdl), stream_(stream) {}
 
-TorchCommNCCLXPersistentRequest::~TorchCommNCCLXPersistentRequest() {
-  // TorchComm should have aborted process if commAbort is called (see
-  // TorchCommNCCLX::abortNcclComm).
+TorchCommNCCLXPersistentRequest::~TorchCommNCCLXPersistentRequest() noexcept {
+  // After commAbort, pFree may fail; NCCLX_CHECK_IGNORE handles this
+  // gracefully.
   auto nccl_api = comm_->getNcclApi();
-  ncclResult_t result = nccl_api->pFree(hdl_);
-  if (result != ncclSuccess) {
-    throw NCCLException(
-        *nccl_api, "NCCL pFree failed", result, comm_->nccl_comm_);
-  }
+  NCCLX_CHECK_IGNORE(nccl_api, nccl_api->pFree(hdl_), "NCCLX pFree failed");
   TC_LOG(INFO, nullptr) << "Finalized persistent request";
 }
 
@@ -32,5 +28,4 @@ std::optional<cudaStream_t> TorchCommNCCLXPersistentRequest::getStream() const {
   return stream_;
 }
 
-} // namespace comms
-} // namespace torch
+} // namespace torch::comms

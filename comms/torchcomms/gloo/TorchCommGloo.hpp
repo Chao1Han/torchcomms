@@ -14,11 +14,9 @@
 #include "comms/torchcomms/TorchComm.hpp"
 #include "comms/torchcomms/TorchCommBackend.hpp"
 #include "comms/torchcomms/TorchCommBatch.hpp"
-#include "comms/torchcomms/TorchCommTracing.hpp"
 #include "comms/torchcomms/gloo/TorchWorkGloo.hpp"
 
-namespace torch {
-namespace comms {
+namespace torch::comms {
 
 class TorchCommGloo : public TorchCommBackend,
                       public std::enable_shared_from_this<TorchCommGloo> {
@@ -197,16 +195,15 @@ class TorchCommGloo : public TorchCommBackend,
     UNINITIALIZED,
     INITIALIZED,
     FINALIZED,
-  } init_state_{0};
+  } init_state_{InitializationState::UNINITIALIZED};
 
-  std::shared_ptr<TorchCommTracing> tracing_;
   std::string name_;
 
   c10::intrusive_ptr<c10d::Store> store_;
   std::shared_ptr<gloo::Context> context_;
 
   uint32_t collectiveCounter_{0};
+  uint32_t splitCounter_{0};
 };
 
-} // namespace comms
-} // namespace torch
+} // namespace torch::comms

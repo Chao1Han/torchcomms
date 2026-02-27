@@ -52,7 +52,8 @@ getDevMemType(const void* addr, const int cudaDev, DevMemType& memType) {
     in ROCm to determine whether the memory is cudaMalloc-ed.
   */
 
-#if defined(USE_ROCM)
+#if defined(USE_ROCM) || defined(__HIP_PLATFORM_AMD__) || \
+    defined(__HIP_PLATFORM_HCC__)
   CUmemAccessDesc accessDesc = {};
   accessDesc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
   accessDesc.location.id = cudaDev;
@@ -62,6 +63,10 @@ getDevMemType(const void* addr, const int cudaDev, DevMemType& memType) {
       FB_CUPFN(cuMemGetAccess)(&flags, &accessDesc.location, (CUdeviceptr)addr);
 
   if (ret == CUDA_ERROR_INVALID_VALUE) {
+    // On ROCm, cuMemGetAccess returns CUDA_ERROR_INVALID_VALUE for cudaMalloc
+    // memory. This may also leave a benign error in the HIP runtime error
+    // queue. Clear it to prevent propagation to user code.
+    (void)cudaGetLastError();
     memType = DevMemType::kCudaMalloc;
     return commSuccess;
   } else if (ret != CUDA_SUCCESS) {
@@ -86,4 +91,23 @@ getDevMemType(const void* addr, const int cudaDev, DevMemType& memType) {
   return commSuccess;
 
 #endif
+}
+
+commResult_t getCudaDevFromPtr(const void* addr, int& cudaDev) {
+  if (addr == nullptr) {
+    return commInvalidUsage;
+  }
+
+  cudaPointerAttributes attr;
+  FB_CUDACHECK(cudaPointerGetAttributes(&attr, addr));
+
+  // For device or managed memory, use the device from attributes
+  if (attr.type == cudaMemoryTypeDevice || attr.type == cudaMemoryTypeManaged) {
+    cudaDev = attr.device;
+  } else {
+    // For host memory (pinned or unregistered), use current device
+    FB_CUDACHECK(cudaGetDevice(&cudaDev));
+  }
+
+  return commSuccess;
 }

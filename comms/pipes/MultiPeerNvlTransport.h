@@ -2,12 +2,19 @@
 
 #pragma once
 
-#include "comms/common/IpcMemHandler.h"
+#include <memory>
+
+#include "comms/pipes/GpuMemHandler.h"
 #include "comms/pipes/P2pNvlTransportDevice.cuh"
-#include "comms/testinfra/mpi/MpiBootstrap.h"
+#include "comms/pipes/Transport.cuh"
 #include "comms/utils/CudaRAII.h"
 
 namespace comms::pipes {
+
+// Forward declarations for multi-peer device transport types
+class MultiPeerDeviceTransport;
+class WindowMemory;
+struct Transport;
 
 /**
  * Configuration for multi-peer NVLink transport.
@@ -31,6 +38,12 @@ struct MultiPeerNvlTransportConfig {
   // Higher = better latency hiding but more memory.
   // Typical: 2-4 for most workloads.
   std::size_t pipelineDepth{0};
+
+  // Number of P2P signal slots per peer for chunk-level pipeline coordination.
+  // Used by signalBufferHandler_ and P2pNvlTransportDevice for send()/recv().
+  // This is separate from WindowMemoryConfig.signalCount (inbox model).
+  // Typical: 1-num of blocks for most workloads.
+  std::size_t p2pSignalCount{1};
 };
 
 /**
@@ -38,8 +51,15 @@ struct MultiPeerNvlTransportConfig {
  *
  * Manages NVLink communication across multiple GPU ranks by:
  * 1. Allocating shared buffers with per-peer regions
- * 2. Exchanging IPC handles for direct GPU-to-GPU access
+ * 2. Exchanging memory handles for direct GPU-to-GPU access
  * 3. Providing P2pNvlTransportDevice handles for CUDA kernels
+ *
+ * MEMORY SHARING MODES (automatic fallback):
+ * - Fabric handles (H100+, CUDA 12.3+): Enables multi-node NVLink on GB200
+ * - cudaIpcMemHandle (fallback): Works on all CUDA GPUs, intra-node only
+ *
+ * The mode is automatically detected at construction time. Use
+ * getMemSharingMode() to check which mode is active.
  *
  * COMMUNICATOR SEMANTICS:
  * - Constructor and exchange() are COLLECTIVE operations (all ranks must call)
@@ -60,6 +80,12 @@ struct MultiPeerNvlTransportConfig {
  */
 class MultiPeerNvlTransport {
  public:
+  // Non-copyable and non-movable (CUDA resources cannot be safely moved)
+  MultiPeerNvlTransport(const MultiPeerNvlTransport&) = delete;
+  MultiPeerNvlTransport& operator=(const MultiPeerNvlTransport&) = delete;
+  MultiPeerNvlTransport(MultiPeerNvlTransport&&) = delete;
+  MultiPeerNvlTransport& operator=(MultiPeerNvlTransport&&) = delete;
+
   /**
    * Constructor - Initialize multi-peer NVLink transport
    *
@@ -67,38 +93,51 @@ class MultiPeerNvlTransport {
    * - Data buffer: for staging data transfers (nRanks-1 peer regions)
    * - State buffer: for chunk-level synchronization states
    *
-   * Does NOT exchange IPC handles - call exchange() after construction.
+   * Memory sharing mode is automatically detected:
+   * - Fabric handles (H100+, CUDA 12.3+): Enables GB200 multi-node NVLink
+   * - cudaIpcMemHandle (fallback): Works on all CUDA GPUs, intra-node only
+   *
+   * Does NOT exchange memory handles - call exchange() after construction.
    *
    * @param myRank This rank's ID in the communicator (0 to nRanks-1)
    * @param nRanks Total number of ranks in the communicator
-   * @param mpiBootstrap Communicator for collective IPC handle exchange
+   * @param bootstrap Bootstrap interface for collective handle exchange
    * @param multiPeerNvlTransportConfig Buffer configuration (must match across
    * all ranks)
    *
-   * @throws std::runtime_error if CUDA buffer allocation fails
+   * @throws std::runtime_error if buffer allocation fails
    */
   MultiPeerNvlTransport(
       int myRank,
       int nRanks,
-      std::shared_ptr<meta::comms::MpiBootstrap> mpiBootstrap,
+      std::shared_ptr<ctran::bootstrap::IBootstrap> bootstrap,
       const MultiPeerNvlTransportConfig& multiPeerNvlTransportConfig);
 
   /**
-   * exchange - Exchange IPC memory handles across all ranks
+   * Destructor - Clean up CUDA resources
+   *
+   * Frees device memory allocated for Transport array.
+   */
+  ~MultiPeerNvlTransport() = default;
+
+  /**
+   * exchange - Exchange memory handles across all ranks
    *
    * COLLECTIVE OPERATION: All ranks MUST call this before using
    * getP2pTransportDevice().
    *
-   * Performs collective IPC handle exchange using the mpiBootstrap
-   * communicator:
-   * 1. Each rank shares its local buffer's IPC handle with all other ranks
-   * 2. Each rank receives IPC handles from all other ranks
+   * Performs collective handle exchange using the bootstrap interface:
+   * 1. Each rank shares its local buffer's handle with all other ranks
+   * 2. Each rank receives handles from all other ranks
    * 3. Implicit barrier ensures all ranks complete before returning
+   *
+   * The type of handle (fabric or cudaIpc) depends on the automatically
+   * detected memory sharing mode.
    *
    * After this call completes, all ranks can access each other's buffers via
    * NVLink using the handles obtained from getP2pTransportDevice().
    *
-   * @throws May throw if IPC handle exchange fails or communicator errors occur
+   * @throws May throw if handle exchange fails or communicator errors occur
    */
   void exchange();
 
@@ -112,7 +151,7 @@ class MultiPeerNvlTransport {
    *
    * The returned device handle contains:
    * - Local buffer pointers (this rank's buffers, accessible locally)
-   * - Remote buffer pointers (peer's buffers, accessible via NVLink IPC)
+   * - Remote buffer pointers (peer's buffers, accessible via NVLink)
    * - Configuration parameters (chunk size, pipeline depth, etc.)
    *
    * @param peerRank Target peer rank ID (must be in range [0, nRanks) and !=
@@ -125,26 +164,104 @@ class MultiPeerNvlTransport {
    */
   P2pNvlTransportDevice getP2pTransportDevice(int peerRank);
 
+  /**
+   * getMultiPeerDeviceTransport - Get unified device handle for all peers
+   *
+   * Returns a MultiPeerDeviceTransport that provides:
+   * - DeviceWindowSignal with inbox semantics (all peers write to this rank's
+   * inbox)
+   * - DeviceWindowBarrier for multi-peer synchronization
+   * - Peer-indexed send/recv operations
+   *
+   * PRECONDITION: exchange() must have been called by all ranks first.
+   * PRECONDITION: wm.exchange() must have been called by all ranks first.
+   *
+   * The returned device handle is designed for multi-peer collective operations
+   * where a single kernel needs to communicate with multiple peers.
+   *
+   * @param wm WindowMemory providing sync primitives (signal, barrier)
+   * @return MultiPeerDeviceTransport handle for use in CUDA kernels
+   *
+   * @note Thread-safe after exchange() completes
+   * @note The returned handle is copyable and can be passed to multiple kernels
+   */
+  MultiPeerDeviceTransport getMultiPeerDeviceTransport(const WindowMemory& wm);
+
+  /**
+   * getDeviceTransports - Get device-accessible array of Transport objects
+   *
+   * Returns a DeviceSpan of Transport objects indexed by global rank.
+   * Each element is either a P2pNvlTransportDevice (for peer ranks) or a
+   * P2pSelfTransportDevice (for myRank).
+   *
+   * PRECONDITION: exchange() must have been called by all ranks first.
+   *
+   * @return DeviceSpan<Transport> of size nRanks, indexed by global rank
+   *
+   * @note Thread-safe after exchange() completes
+   * @note The span points to device memory owned by this transport
+   */
+  DeviceSpan<Transport> getDeviceTransports();
+
+  /**
+   * Check if fabric-based transport is supported (H100+, CUDA 12.3+).
+   *
+   * Note: Even if this returns false, the transport will still work using
+   * cudaIpcMemHandle fallback (intra-node only).
+   *
+   * @return true if fabric handles are available for multi-node NVLink
+   */
+  static bool isFabricSupported() {
+    return GpuMemHandler::isFabricHandleSupported();
+  }
+
+  /**
+   * Get the memory sharing mode being used by this transport.
+   *
+   * @return kFabric for H100+/CUDA12.3+, kCudaIpc for fallback
+   */
+  MemSharingMode getMemSharingMode() const {
+    return dataBufferHandler_->getMode();
+  }
+
  private:
+  // ==========================================================================
+  // Lazy initialization helpers for getMultiPeerDeviceTransport()
+  // ==========================================================================
+
+  // Initialize transports array on device (both P2P and SELF transports)
+  void initializeTransportsArray();
+
+  // ==========================================================================
+  // Member variables
+  // ==========================================================================
+
   const int myRank_{-1};
   const int nRanks_{-1};
-  // TODO: make it ctran::bootstrap::IBootstrap when integrating with Ctran
-  std::shared_ptr<meta::comms::MpiBootstrap> mpiBootstrap_;
+  std::shared_ptr<ctran::bootstrap::IBootstrap> bootstrap_;
   const MultiPeerNvlTransportConfig config_;
 
-  // data buffer: staging buffer for send/recv data
-  // state buffer: buffer for signaling
-  std::unique_ptr<meta::comms::DeviceBuffer> dataBuffer_d_;
-  std::unique_ptr<meta::comms::DeviceBuffer> stateBuffer_d_;
+  // GpuMemHandler-based memory for data, state, and signal buffers
+  // Automatically uses fabric handles on H100+/CUDA12.3+, falls back to cudaIpc
+  std::unique_ptr<GpuMemHandler> dataBufferHandler_;
+  std::unique_ptr<GpuMemHandler> stateBufferHandler_;
+  std::unique_ptr<GpuMemHandler> signalBufferHandler_;
 
-  // TODO: refactor IpcMemHandler to handle multiple ipcHandles exchange and
-  // merge into one IpcMemHandler
-  std::unique_ptr<meta::comms::IpcMemHandler> dataBufferHandler_;
-  std::unique_ptr<meta::comms::IpcMemHandler> stateBufferHandler_;
+  // Device-accessible Transport array for multi-peer transport
+  // Allocated on device and populated in getMultiPeerDeviceTransport()
+  // Uses DeviceBuffer instead of GpuMemHandler since no exchange is needed
+  std::unique_ptr<meta::comms::DeviceBuffer> transportsDevice_;
 
   // Per-peer buffer sizes for offset calculation
   std::size_t perPeerDataBufferSize_{0};
-  std::size_t perPeerStateBufferSize_{0};
+  std::size_t perPeerChunkStateBufferSize_{0};
+  std::size_t perPeerSignalBufferSize_{0};
+
+  // Flag to track if multi-peer device arrays have been initialized
+  bool multiPeerInitialized_{false};
+
+  // Cached memory sharing mode (detected once in constructor)
+  MemSharingMode memSharingMode_;
 };
 
 } // namespace comms::pipes

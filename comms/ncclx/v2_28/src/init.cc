@@ -656,6 +656,53 @@ static void showVersion() {
   }
 }
 
+static constexpr std::string_view kDeviceRackSerial = "DEVICE_RACK_SERIAL"; /* key in topology file */
+static ncclResult_t ncclxGetDeviceRackSerial(ncclComm* comm, int* rackSerial) {
+  if (comm == nullptr) {
+    WARN("Invalid state or comm pointer");
+    return ncclInvalidArgument;
+  }
+
+  std::ifstream file(NCCL_TOPO_FILE_PATH);
+  if (!file.is_open()) {
+    WARN("Failed to open topology file: %s", NCCL_TOPO_FILE_PATH.c_str());
+    return ncclSystemError;
+  }
+
+  std::string rackSerialStr;
+  std::string line;
+  bool found = false;
+
+  while (std::getline(file, line)) {
+    size_t pos = line.find('=');
+    if (pos == std::string::npos) {
+      continue;
+    }
+
+    std::string key = line.substr(0, pos);
+    std::string value = line.substr(pos + 1);
+
+    if (key == kDeviceRackSerial) {
+      if (!value.empty()) {
+        rackSerialStr = std::move(value);
+        found = true;
+        break;
+      }
+    }
+  }
+
+  if (!found) {
+    INFO(NCCL_INIT, "No rack serial found in topology file");
+  }
+
+  auto maybeRackSerial = folly::tryTo<int>(rackSerialStr);
+  CHECK(maybeRackSerial.hasValue());
+  *rackSerial = maybeRackSerial.value();
+
+  file.close();
+  return ncclSuccess;
+}
+
 NCCL_PARAM(MNNVLUUID, "MNNVL_UUID", -1);
 NCCL_PARAM(MNNVLCliqueId, "MNNVL_CLIQUE_ID", -1);
 
@@ -704,7 +751,15 @@ static ncclResult_t fillInfo(struct ncclComm* comm, struct ncclPeerInfo* info, u
       }
       memcpy(&uuid0, info->fabricInfo.clusterUuid, sizeof(uuid0));
       memcpy(&uuid1, info->fabricInfo.clusterUuid + sizeof(uuid0), sizeof(uuid1));
-      if (ncclParamMNNVLCliqueId() == -2) {
+      if (NCCL_MNNVL_DETERMINISTIC_COLLECTIVE_ENABLE && NCCL_MNNVL_CLIQUE_SIZE <= 0) {
+        WARN("NCCL_MNNVL_CLIQUE_SIZE must be set to a positive integer when NCCL_MNNVL_DETERMINISTIC_COLLECTIVE_ENABLE is set");
+        return ncclInvalidArgument;
+      }
+      if (NCCL_MNNVL_DETERMINISTIC_COLLECTIVE_ENABLE && NCCL_MNNVL_CLIQUE_SIZE > 0) {
+        int cliqueId = -1;
+        ncclx::assignMnnvlCliqueIdBasedOnCliqueSize(&cliqueId);
+        info->fabricInfo.cliqueId = cliqueId;
+      } else if (ncclParamMNNVLCliqueId() == -2) {
         nvmlPlatformInfo_t platformInfo = { 0 };
         NCCLCHECK(ncclNvmlDeviceGetPlatformInfo(nvmlDev, &platformInfo));
         INFO(NCCL_INIT, "MNNVL rack serial %s slot %d tray %d hostId %d peerType %d moduleId %d",
@@ -712,11 +767,16 @@ static ncclResult_t fillInfo(struct ncclComm* comm, struct ncclPeerInfo* info, u
              platformInfo.hostId, platformInfo.peerType, platformInfo.moduleId);
         // Use a hash of the Rack serial number to partition the NVLD clique
         info->fabricInfo.cliqueId = getHash(platformInfo.chassisSerialNumber, sizeof(platformInfo.chassisSerialNumber));
-      } else if (ncclParamMNNVLCliqueId() != -1) info->fabricInfo.cliqueId = ncclParamMNNVLCliqueId();
+      } else if (ncclParamMNNVLCliqueId() != -1) {
+        info->fabricInfo.cliqueId = ncclParamMNNVLCliqueId();
+      }
       INFO(NCCL_INIT, "MNNVL busId 0x%lx fabric UUID %lx.%lx cliqueId 0x%x state %d healthMask 0x%x",
            info->busId,
            uuid0, uuid1,
            info->fabricInfo.cliqueId, info->fabricInfo.state, info->fabricInfo.healthMask);
+      if(NCCL_MNNVL_TRUNK_DISABLE) {
+        NCCLCHECK(ncclxGetDeviceRackSerial(comm, &info->rackSerial));
+      }
     }
   }
 
@@ -2228,9 +2288,11 @@ static ncclResult_t ncclCommInitRankDev(ncclComm_t* newcomm, int nranks, int nId
   comm->startMagic = comm->endMagic = NCCL_MAGIC; // Used to detect comm corruption.
   // Ctran can be enabled either globally via CVAR or per-communicator using hint
   comm->useCtran_ = ncclx::commUseCtran();
-  INFO(NCCL_INIT, "CommInit comm %p commHash 0x%lx commDesc %s useCtran %d: %s",
+  comm->usePatAvg_ = ncclx::commUsePatAvg();
+  INFO(NCCL_INIT, "CommInit comm %p commHash 0x%lx commDesc %s useCtran %d usePatAvg %d: %s %s",
        comm, getHash(commId->internal, NCCL_UNIQUE_ID_BYTES), ctran::utils::parseCommDesc(config->commDesc),
-       comm->useCtran_, ncclx::getCommUseCtranConfig().c_str());
+       comm->useCtran_, comm->usePatAvg_, ncclx::getCommUseCtranConfig().c_str(),
+       ncclx::getCommUsePatAvgConfig().c_str());
   *comm->abortFlagRefCount = 1;
   NCCLCHECKGOTO(parseCommConfig(comm, config), res, fail);
   /* start with ncclInProgress and will be changed to ncclSuccess if init succeeds. */
@@ -2919,9 +2981,11 @@ static ncclResult_t ncclCommInitChildComm(ncclComm_t comm, ncclComm_t* newcomm, 
     childComm->initState = ncclInternalError;
     // Ctran can be enabled either globally via CVAR or per-communicator using hint
     childComm->useCtran_ = ncclx::commUseCtran();
-    INFO(NCCL_INIT, "CommSplit comm %p commDesc %s useCtran %d: %s",
+    childComm->usePatAvg_ = ncclx::commUsePatAvg();
+    INFO(NCCL_INIT, "CommSplit comm %p commDesc %s useCtran %d usePatAvg %d: %s %s",
         childComm, ctran::utils::parseCommDesc(childComm->config.commDesc),
-        childComm->useCtran_, ncclx::getCommUseCtranConfig().c_str());
+        childComm->useCtran_, childComm->usePatAvg_, ncclx::getCommUseCtranConfig().c_str(),
+        ncclx::getCommUsePatAvgConfig().c_str());
   }
 
   NCCLCHECKGOTO(ncclCalloc(&job, 1), res, fail);
@@ -3029,8 +3093,16 @@ ncclResult_t ncclCommGetAsyncError(ncclComm_t comm, ncclResult_t *asyncError) {
   *asyncError = __atomic_load_n(&comm->asyncResult, __ATOMIC_ACQUIRE);
   if (*asyncError == ncclSuccess && comm->proxyState) *asyncError = __atomic_load_n(&comm->proxyState->asyncResult, __ATOMIC_ACQUIRE);
 
-  /* Check gin status */
-  if (*asyncError == ncclSuccess && comm->sharedRes && comm->sharedRes->ginState.ncclGin) {
+  /* Check gin status -- only after GIN initialization is fully complete.
+   * ncclGinQueryLastError queries GDAKI QP error states via
+   * doca_gpu_verbs_query_last_error(). During ncclGinConnectOnce /
+   * ncclGinGdakiCreateContext, QPs are still transitioning through IB
+   * states (INIT -> RTR -> RTS) and report spurious errors that appear
+   * as ncclRemoteError. ginState->connected is only set true after
+   * ncclGinConnectOnce fully completes, so gating on it avoids querying
+   * QPs that are mid-initialization. */
+  if (*asyncError == ncclSuccess && comm->sharedRes && comm->sharedRes->ginState.ncclGin
+      && comm->sharedRes->ginState.connected) {
     struct ncclGinState* ginState = &comm->sharedRes->ginState;
     // Gin progress thread status
     if (ginState->needsProxyProgress) *asyncError = __atomic_load_n(&comm->sharedRes->ginState.asyncResult, __ATOMIC_ACQUIRE);

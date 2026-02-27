@@ -13,6 +13,7 @@
 #include "comms/ctran/colltrace/MapperTrace.h"
 #include "comms/ctran/mapper/CtranMapper.h"
 #include "comms/ctran/mapper/CtranMapperTypes.h"
+#include "comms/ctran/regcache/IpcRegCache.h"
 #include "comms/ctran/regcache/RegCache.h"
 #include "comms/ctran/utils/Checks.h"
 #include "comms/utils/StrUtils.h"
@@ -26,6 +27,7 @@
 #endif
 
 using namespace ncclx;
+using namespace ctran;
 namespace {
 std::vector<CtranMapperBackend> getToEnableBackends(
     const std::vector<CommBackend>& overrideBackend) {
@@ -74,6 +76,24 @@ CtranMapper::CtranMapper(CtranComm* comm) {
       statex->nRanks()};
 
   this->comm = comm;
+
+  if (NCCL_CTRAN_IPC_REGCACHE_ENABLE_ASYNC_SOCKET) {
+    CLOGF_SUBSYS(
+        INFO,
+        INIT,
+        "CTRAN-MAPPER: IpcRegCache socket server enabled, initializing");
+    // Initialize IpcRegCache singleton (idempotent - only initializes once)
+    ctran::IpcRegCache::getInstance()->init();
+
+    // AllGather IPC server addresses after comm is set
+    FB_COMMCHECKTHROW_EX(allGatherIpcServerAddrs(), comm->logMetaData_);
+  } else {
+    CLOGF_SUBSYS(
+        INFO,
+        INIT,
+        "CTRAN-MAPPER: IpcRegCache socket server disabled via NCCL_CTRAN_IPC_REGCACHE_ENABLE_ASYNC_SOCKET=0, skipping init");
+  }
+
   auto backendsToEnable = getToEnableBackends(comm->config_.backends);
 
   iPutCount = std::vector<int>(CtranMapperBackend::NUM_BACKENDS, 0);
@@ -138,7 +158,6 @@ CtranMapper::CtranMapper(CtranComm* comm) {
     if (this->ctranIb || this->ctranSock || this->ctranTcpDm) {
       try {
         this->ctranNvl = std::make_unique<class CtranNvl>(comm);
-        this->ctranNvl->regCtrlCb(this->ctrlMgr);
       } catch ([[maybe_unused]] const std::bad_alloc& e) {
         enableBackends_[CtranMapperBackend::NVL] = false;
         // FIXME: give more specific exception + error message
@@ -388,7 +407,7 @@ CtranMapper::~CtranMapper() {
 
   this->reportProfiling(true);
 
-  // Release any pending CB_CTRL requests;
+  // Release any pending IPC release requests;
   // intentionally avoid progress polling in destructor to ensure it is never
   // blocked.
   this->postedCbCtrlReqs_.clear();
@@ -412,50 +431,55 @@ commResult_t CtranMapper::epochUnlock() {
   return commSuccess;
 }
 
-commResult_t CtranMapper::remReleaseMem(ctran::regcache::RegElem* regElem) {
-  if (!this->atDestruction) {
-    // Notify remote rank to release previous imported memory via NVL backend.
-    // Skip if deregMem is called at destruction, since remote rank will release
-    // any remaining imported memory at destruction.
-    auto exportedNvlRanks = exportRegCache_.wlock()->remove(regElem);
-    for (auto peerRank : exportedNvlRanks) {
-      // We ensure the remote rank always release before next import because
-      // all control messages to the given peer are transferred in order via a
-      // single vc's control channel. This guarantee can prevent the remote rank
-      // misuse a previously imported and cached segment if the same vaddr of
-      // the segment is reused in a future importing segment but mapped to a
-      // different range.
+commResult_t CtranMapper::allGatherIpcServerAddrs() {
+  const int nRanks = comm->statex_->nRanks();
+  const int myRank = comm->statex_->rank();
+  std::vector<sockaddr_storage> peerAddrs(nRanks);
 
-      auto backend =
-          ctranIb ? CtranMapperBackend::IB : CtranMapperBackend::SOCKET;
-      std::unique_ptr<CbCtrlRequest> req =
-          std::make_unique<CbCtrlRequest>(peerRank, backend);
+  ctran::IpcRegCache::getInstance()->getServerAddr().getAddress(
+      &peerAddrs[myRank]);
+  auto resFuture = comm->bootstrap_->allGather(
+      peerAddrs.data(), sizeof(sockaddr_storage), myRank, nRanks);
+  FB_COMMCHECK(static_cast<commResult_t>(std::move(resFuture).get()));
 
-      FB_COMMCHECK(CtranNvl::remReleaseMem(regElem->nvlRegElem, req->msg));
-      if (this->ctranIb) {
-        FB_COMMCHECK(this->ctranIb->isendCtrlMsg(
-            req->msg.type,
-            &req->msg,
-            sizeof(ControlMsg),
-            peerRank,
-            req->ibReq));
-      } else if (this->ctranSock) {
-        FB_COMMCHECK(
-            this->ctranSock->isendCtrlMsg(req->msg, peerRank, req->sockReq));
-      }
-      // TCPDM does not share local memory registration with the remote
-      // and does not need to release it.
-
-      CLOGF_TRACE(
-          COLL,
-          "CTRAN-MAPPER: Posted CB ctrlmsg to rank {}: {}",
-          peerRank,
-          req->msg.toString());
-
-      // cbCtrl requests will be checked in progress and erase & free at
-      // completion. mapper needs to free up all cbCtrl requests at destruction.
-      this->postedCbCtrlReqs_.push_back(std::move(req));
+  // Update IpcRegCache with gathered peer addresses, keyed by gPid
+  auto ipcRegCache = ctran::IpcRegCache::getInstance();
+  for (int rank = 0; rank < nRanks; ++rank) {
+    // If bootstrap allGather fails or server address is unspecified, skip it
+    if (peerAddrs[rank].ss_family == AF_UNSPEC) {
+      CLOGF_SUBSYS(
+          WARN,
+          INIT,
+          "CTRAN-MAPPER: IPC server address is unspecified for rank {}",
+          rank);
+      continue;
     }
+    const std::string peerId = comm->statex_->gPid(rank);
+    folly::SocketAddress addr;
+    addr.setFromSockaddr(reinterpret_cast<const sockaddr*>(&peerAddrs[rank]));
+    FB_COMMCHECK(ipcRegCache->setPeerIpcServerAddr(peerId, addr));
+  }
+
+  CLOGF_SUBSYS(
+      INFO,
+      INIT,
+      "CTRAN-MAPPER: AllGathered IPC server addresses from {} ranks",
+      nRanks);
+  return commSuccess;
+}
+
+commResult_t CtranMapper::remReleaseMem(ctran::regcache::RegElem* regElem) {
+  // Notify remote peer to release previous imported memory via NVL backend.
+  // Shouldn't skip it even at destruction, since imported memory is stored in
+  // IpcRegCache singleton and not cleared at mapper destruction
+
+  // Delegate to IpcRegCache for IPC-based remote release
+  auto ipcRegElem =
+      reinterpret_cast<ctran::regcache::IpcRegElem*>(regElem->ipcRegElem);
+  if (ipcRegElem != nullptr) {
+    FB_COMMCHECK(
+        ctran::IpcRegCache::getInstance()->remReleaseMem(
+            comm->statex_->gPid(), ipcRegElem, this->postedCbCtrlReqs_));
   }
 
   return commSuccess;
@@ -472,25 +496,43 @@ commResult_t CtranMapper::regMem(
   ctran::CHECK_VALID_REGCACHE(regCache);
 
   const int cudaDev = comm->statex_->cudaDev();
-  // Cache segment.
-  // regCache either returns an already cached handle or create a
+  // Cache the buffer.
+  // regMem only allows for single-segment buffers.
+  // cacheSegment either returns an already cached handle or creates a
   // new entry if the segment is not yet cached.
-  ctran::regcache::Segment* segment = nullptr;
-  void* segHdl_ = nullptr;
 
+  std::vector<ctran::regcache::Segment*> segments;
+  std::vector<void*> segHdls;
   FB_COMMCHECK(regCache->cacheSegment(
       buf,
       len,
       cudaDev,
       ncclManaged,
       logMetaData_.commHash,
-      &segment,
-      &segHdl_));
+      segments,
+      segHdls));
 
-  // Register the segment only if in Eager mode or forced by caller
+  FB_CHECKABORT(
+      !segments.empty(),
+      "cacheSegment returned no segments for buf {} len {}",
+      buf,
+      len);
+
+  // regMem is designed for single-segment buffers.
+  // For multi-segment buffers, use the global registration API.
+  FB_CHECKABORT(
+      segments.size() == 1,
+      "regMem expects single segment but found {} segments for buf {} len {}. "
+      "Use ncclGlobalRegisterWithPtr for multi-segment buffers (expandable memory).",
+      segments.size(),
+      buf,
+      len);
+
+  // Register the buffer only if in Eager mode or forced by caller.
   ctran::regcache::RegElem* regHdl_ = nullptr;
   if (NCCL_CTRAN_REGISTER == NCCL_CTRAN_REGISTER::eager || forceRegist) {
     bool didRegister = false;
+    auto* segment = segments.front();
     FB_COMMCHECK(regCache->regRange(
         segment->range.buf,
         segment->range.len,
@@ -503,7 +545,7 @@ commResult_t CtranMapper::regMem(
         ncclManaged));
   }
 
-  *segHdl = segHdl_;
+  *segHdl = segHdls.front();
   if (regHdl) {
     *regHdl = regHdl_;
   }
@@ -518,6 +560,14 @@ DevMemType CtranMapper::segmentType(void* segHdl) {
   return segment->getType();
 }
 
+const void* CtranMapper::segmentBuf(void* segHdl) {
+  auto regCache = ctran::RegCache::getInstance();
+  ctran::CHECK_VALID_REGCACHE(regCache);
+
+  ctran::regcache::Segment* segment = regCache->getSegment(segHdl);
+  return segment ? segment->range.buf : nullptr;
+}
+
 commResult_t CtranMapper::deregMem(void* segHdl, const bool skipRemRelease) {
   auto regCache = ctran::RegCache::getInstance();
   ctran::CHECK_VALID_REGCACHE(regCache);
@@ -530,24 +580,23 @@ commResult_t CtranMapper::deregMem(void* segHdl, const bool skipRemRelease) {
   auto timerBegin = std::chrono::steady_clock::now();
   auto regElems = regCache->getRegElems(segHdl);
   if (!skipRemRelease) {
-    // Release remote registration associated with each regElem within this
-    // communicator.
-
-    // Acquire epoch lock for thread-safe ctrl msg exchange via backend.
-    // Require the caller not call it within an existing epoch lock.
-    // NCCL_CTRAN_IB_EPOCH_LOCK_ENFORCE_CHECK is enabled in UT to check misuse
-    // within Ctran.
-    epochLock();
+    // Release remote registration associated with each regElem.
+    // No epoch lock needed - remReleaseMem delegates to IpcRegCache which uses
+    // AsyncSocket for IPC release notifications. AsyncSocket runs on its own
+    // EventBase thread and does not access CtranIb resources.
     for (auto& regElem : regElems) {
       FB_COMMCHECK(remReleaseMem(regElem));
     }
-    epochUnlock();
   } else {
-    // Skip remote release, just remove the regElems from local exportRegCache_.
-    // The caller is responsible to release all remote registration (e.g., in
-    // winFree)
+    // Skip remote release, just remove the regElems from IpcRegCache export
+    // cache. The caller is responsible to release all remote registration
+    // (e.g., in winFree)
     for (auto& regElem : regElems) {
-      exportRegCache_.wlock()->remove(regElem);
+      auto ipcRegElem =
+          reinterpret_cast<ctran::regcache::IpcRegElem*>(regElem->ipcRegElem);
+      if (ipcRegElem != nullptr) {
+        ctran::IpcRegCache::getInstance()->removeExport(ipcRegElem);
+      }
     }
   }
 
@@ -603,12 +652,15 @@ commResult_t CtranMapper::deregDynamic(void* regHdl) {
 
 commResult_t CtranMapper::deregRemReg(struct CtranMapperRemoteAccessKey* rkey) {
   switch (rkey->backend) {
-    case CtranMapperBackend::NVL:
+    case CtranMapperBackend::NVL: {
       FB_CHECKABORT(
           ctranNvl != nullptr,
           "Unexpected rkey with NVL backend but ctranNvl is not initialized");
-      FB_COMMCHECK(ctranNvl->releaseMem(&rkey->nvlKey));
+      FB_COMMCHECK(
+          ctran::IpcRegCache::getInstance()->releaseRemReg(
+              rkey->nvlKey.peerId, rkey->nvlKey.basePtr, rkey->nvlKey.uid));
       break;
+    }
     default:
       // no-op for other backends
       break;
@@ -935,11 +987,6 @@ commResult_t CtranMapper::intraBarrier() {
     FB_COMMCHECK(waitRequest(&req));
   }
   return commSuccess;
-}
-
-std::unordered_map<ctran::regcache::RegElem*, std::unordered_set<int>>
-CtranMapper::dumpExportRegCache() const {
-  return exportRegCache_.rlock()->dump();
 }
 
 std::string CtranMapperNotify::toString() const {

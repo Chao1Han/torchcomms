@@ -15,8 +15,7 @@
 #include <memory>
 #include <string>
 
-namespace torch {
-namespace comms {
+namespace torch::comms {
 
 // Forward declarations
 class TorchWork;
@@ -91,13 +90,22 @@ constexpr std::string_view toString(OpName name) {
   return "unknown";
 }
 
+/**
+ * TorchComm - Main communication abstraction for TorchComms.
+ *
+ * Thread Safety:
+ * TorchComm is NOT thread-safe. Users must not call TorchComm operations
+ * from multiple threads simultaneously. All operations (collectives,
+ * point-to-point, memory registration, finalize, etc.) must be serialized
+ * by the caller.
+ */
 class TorchComm : public std::enable_shared_from_this<TorchComm> {
  public:
   ~TorchComm() = default;
 
   void finalize();
-  int getRank();
-  int getSize();
+  int getRank() const;
+  int getSize() const;
   std::string_view getCommName() const;
 
   // Point-to-Point Operations
@@ -214,15 +222,31 @@ class TorchComm : public std::enable_shared_from_this<TorchComm> {
     return backend_;
   }
 
-  std::shared_ptr<TorchCommBackend> unsafeGetBackend() {
+  std::shared_ptr<TorchCommBackend> unsafeGetBackend() const {
     return impl_;
   }
 
-  std::shared_ptr<TorchCommWindow> new_window();
+  std::shared_ptr<TorchCommWindow> new_window(
+      const std::optional<at::Tensor>& tensor = std::nullopt);
+
+  // Persistent AllGather operations
+  using AllGatherPHandle = TorchCommBackend::AllGatherPHandle;
+
+  AllGatherPHandle all_gather_p_init(
+      at::Tensor& output,
+      const AllGatherPInitOptions& options = {});
+
+  c10::intrusive_ptr<TorchWork> all_gather_p_exec(
+      AllGatherPHandle handle,
+      const at::Tensor& input,
+      bool async_op,
+      const AllGatherPExecOptions& options = {});
+
+  void all_gather_p_free(AllGatherPHandle handle);
 
   // Hooks
   struct PreHookArgs {
-    OpName name;
+    OpName name{};
     bool async_op{false};
     std::vector<at::Tensor>* input_tensors{nullptr};
     std::vector<at::Tensor>* output_tensors{nullptr};
@@ -235,6 +259,8 @@ class TorchComm : public std::enable_shared_from_this<TorchComm> {
     // For split
     const std::vector<int>* ranks{nullptr};
     const std::string* split_name{nullptr};
+    // Unique operation ID to correlate pre-hook and post-hook calls
+    size_t op_id{0};
   };
   using PreHook = std::function<void(PreHookArgs)>;
   struct PostHookArgs {
@@ -242,13 +268,20 @@ class TorchComm : public std::enable_shared_from_this<TorchComm> {
     std::optional<c10::weak_intrusive_ptr<TorchWork>> work{};
     std::weak_ptr<TorchComm> new_comm{};
     std::weak_ptr<TorchCommWindow> new_window{};
+    // Unique operation ID to correlate pre-hook and post-hook calls
+    size_t op_id{0};
   };
   using PostHook = std::function<void(PostHookArgs)>;
 
   // These are not thread safe and must not be modified while a collective is
   // in progress.
-  RemovableHandle registerPreHook(PreHook preHook);
-  RemovableHandle registerPostHook(PostHook postHook);
+  std::unique_ptr<RemovableHandle> registerPreHook(PreHook preHook);
+  std::unique_ptr<RemovableHandle> registerPostHook(PostHook postHook);
+
+  // Abort hook - called before aborting when a collective times out or fails.
+  // This allows users to capture debug information before the abort.
+  using AbortHook = TorchCommBackend::AbortHook;
+  std::unique_ptr<RemovableHandle> registerAbortHook(AbortHook hook);
 
   // Disable copy and move semantics
   TorchComm(const TorchComm&) = delete;
@@ -277,6 +310,9 @@ class TorchComm : public std::enable_shared_from_this<TorchComm> {
   void preHook(PreHookArgs&& args);
   void postHook(PostHookArgs&& args);
 
+  // Rank validation helper
+  void validateRank(int rank, const char* param_name) const;
+
  private:
   // Backend name
   std::string backend_;
@@ -286,6 +322,8 @@ class TorchComm : public std::enable_shared_from_this<TorchComm> {
   int64_t nextHookId_ = 0;
   std::unordered_map<int64_t, PreHook> preHooks_;
   std::unordered_map<int64_t, PostHook> postHooks_;
+  // Counter for generating unique operation IDs
+  std::atomic<size_t> nextOpId_{0};
 };
 
 // Constructor that creates the appropriate backend implementation
@@ -300,5 +338,4 @@ std::shared_ptr<TorchComm> new_comm(
 // Note: Allocator is created once per backend and reused across all instances
 std::shared_ptr<c10::Allocator> get_mem_allocator(const std::string& backend);
 
-} // namespace comms
-} // namespace torch
+} // namespace torch::comms

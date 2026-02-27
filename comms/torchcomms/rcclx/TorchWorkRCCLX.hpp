@@ -5,6 +5,7 @@
 #include <chrono>
 #include <memory>
 #include <optional>
+#include <string_view>
 
 #include <ATen/ATen.h>
 #include <hip_runtime.h> // @manual=third-party//cuda:cuda-lazy
@@ -12,8 +13,7 @@
 #include "comms/torchcomms/TorchCommTracing.hpp" // @manual=//comms/torchcomms:torchcomms-headers-cpp
 #include "comms/torchcomms/TorchWork.hpp" // @manual=//comms/torchcomms:torchcomms-headers-cpp
 
-namespace torch {
-namespace comms {
+namespace torch::comms {
 
 // Forward declaration
 class TorchCommRCCLX;
@@ -40,27 +40,32 @@ class TorchWorkRCCLX : public TorchWork {
   // Delete the move assignment operator to prevent accidentally stomping over
   // events if the work is in progress.
   TorchWorkRCCLX& operator=(TorchWorkRCCLX&& other) noexcept = delete;
-
-  // Move constructor
-  TorchWorkRCCLX(TorchWorkRCCLX&& other) noexcept;
+  TorchWorkRCCLX(TorchWorkRCCLX&&) = delete;
 
   // Override virtual functions from TorchWork
   void wait() override;
 
   // Check the status of the work object
   WorkStatus checkStatus();
+  std::chrono::milliseconds getTimeout() const override {
+    return timeout_ms_;
+  }
+
+  // Test-only accessors to verify tensor storage behavior
+  // Returns true if any tensors are stored in this work object
+  bool hasTensorsStored() const {
+    return !inputTensors_.empty() || inputTensor_.defined();
+  }
 
  protected:
-  void recordStart(const std::string& coll_name);
+  void recordStart(std::string_view coll_name);
   void recordEnd();
 
   friend class TorchCommRCCLX;
 
  private:
-  void recordFunctionStart(const std::string& coll_name);
-  std::chrono::milliseconds getTimeout() {
-    return timeout_ms_;
-  }
+  void recordFunctionStart(std::string_view coll_name);
+
   // Tensors supplied might either be a vector of tensors,
   // or a single tensor. In case it is a single tensor, we
   // can avoid allocating space for a vector of tensors.
@@ -78,5 +83,4 @@ class TorchWorkRCCLX : public TorchWork {
   std::optional<at::RecordFunction> recordFunction_;
 };
 
-} // namespace comms
-} // namespace torch
+} // namespace torch::comms

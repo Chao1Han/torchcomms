@@ -19,12 +19,11 @@
 #include "comms/torchcomms/TorchCommBackend.hpp"
 #include "comms/torchcomms/TorchCommBatch.hpp"
 #include "comms/torchcomms/TorchCommTracing.hpp"
-#include "comms/torchcomms/device/XpuApi.hpp"
+#include "comms/torchcomms/device/xpu/XpuApi.hpp"
 #include "comms/torchcomms/xccl/TorchWorkXCCL.hpp"
 #include "comms/torchcomms/xccl/XcclApi.hpp"
 
-namespace torch {
-namespace comms {
+namespace torch::comms {
 
 constexpr size_t kMaxEventPoolSize = 1000;
 
@@ -177,8 +176,6 @@ class TorchCommXCCL : public TorchCommBackend,
       const std::string& name,
       const CommOptions& options = {}) override;
 
-  std::shared_ptr<c10::Allocator> getMemAllocator() override;
-
   // Friend access for TorchCommXCCL
   friend class TorchWorkXCCL;
 
@@ -317,5 +314,4 @@ class TorchCommXCCL : public TorchCommBackend,
   std::string name_;
 };
 
-} // namespace comms
-} // namespace torch
+} // namespace torch::comms

@@ -1,11 +1,13 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 #pragma once
 
+#include <fmt/format.h>
 #include <folly/Synchronized.h>
 #include <memory>
 #include <queue>
 #include <unordered_map>
 
+#include "comms/ctran/backends/ib/CtranIbSingleton.h"
 #include "comms/ctran/mapper/CtranMapperTypes.h"
 #include "comms/ctran/utils/Checks.h"
 #include "comms/ctran/utils/CtranAvlTree.h"
@@ -100,7 +102,7 @@ struct RegElem {
   const void* buf{nullptr};
   const std::size_t len{0};
   void* ibRegElem{nullptr};
-  void* nvlRegElem{nullptr};
+  void* ipcRegElem{nullptr};
   void* tcpRegElem{nullptr};
 
   // The state of the segment to ensure thread-safe access.
@@ -190,7 +192,7 @@ struct RegElem {
        << (state == RegElemState::REGISTERED ? "REGISTERED" : "DEREGISTERED")
        << ", isDynamic: " << isDynamic_ << ", lookupHit: " << lookupHit_;
     if (state == RegElemState::REGISTERED) {
-      ss << ", ibRegElem: " << ibRegElem << ", nvlRegElem: " << nvlRegElem
+      ss << ", ibRegElem: " << ibRegElem << ", ipcRegElem: " << ipcRegElem
          << ", tcpRegElem: " << tcpRegElem;
     }
     if (segments_.size()) {
@@ -269,7 +271,24 @@ class RegCache {
   void init();
   commResult_t destroy();
 
+  // Global registration using the globally-set backends.
+  // This allows registration without requiring a communicator.
+  // Backends are initialized from NCCL_CTRAN_BACKENDS cvar in init().
+  // If forceReg is true, registration happens even in async/lazy mode.
+  // deviceId is optional: if not assigned, infer it from getCudaDevFromPtr()
+  commResult_t globalRegister(
+      const void* buf,
+      size_t len,
+      bool forceReg = false,
+      int deviceId = -1);
+
+  // Global deregistration using pointer lookup.
+  // Frees cached segments and their associated registrations.
+  commResult_t globalDeregister(const void* buf, size_t len, int deviceId = -1);
+
   // Thread-safe functions to cache a buffer range into the global cache.
+  // This function uses pinRange to discover all physical segments underlying
+  // the given buffer and caches each one individually.
   // input:
   //   - buf: the buffer to be cached
   //   - len: the length of the buffer
@@ -279,16 +298,16 @@ class RegCache {
   //               (logging purpose only, since commHash may not be 100%
   //               unique).
   // output:
-  //   - segment: the cached segment
-  //   - segHdl: the handle of the cached segment
+  //   - segments: vector of cached segments (one per physical segment chunk)
+  //   - segHdls: vector of handles for the cached segments
   commResult_t cacheSegment(
       const void* buf,
       const std::size_t len,
       const int cudaDev,
       const bool ncclManaged,
       uint64_t commHash,
-      regcache::Segment** segment,
-      void** segHdl);
+      std::vector<regcache::Segment*>& segments,
+      std::vector<void*>& segHdls);
 
   // Thread-safe functions to register a given buffer range.
   // If the buffer is already registered and cached, the pre-existing handle is
@@ -365,9 +384,32 @@ class RegCache {
   // If no regElem is associated, empty vector is returned
   std::vector<regcache::RegElem*> getRegElems(const void* segHdl) const;
 
+  // Get deduplicated regElems associated with multiple segHdls.
+  // Deduplication is needed because a single regElem can span multiple
+  // segments.
+  std::vector<regcache::RegElem*> getRegElems(
+      const std::vector<void*>& segHdls) const;
+
   // Thread-safe functions to get a list of all cached segments in the global
   // cache.
   std::vector<void*> getSegments() const;
+
+  // Look up all cached segments underlying a buffer range.
+  // Uses pinRange to discover physical segments and returns their handles
+  // along with associated regElems for remote release handling.
+  // input:
+  //   - buf: the buffer to look up
+  //   - len: the length of the buffer
+  //   - cudaDev: the cuda device id
+  // output:
+  //   - segHdls: vector of segment handles (one per physical segment)
+  //   - regElems: vector of regElems associated with the segments
+  commResult_t lookupSegmentsForBuffer(
+      const void* buf,
+      size_t len,
+      int cudaDev,
+      std::vector<void*>& segHdls,
+      std::vector<regcache::RegElem*>& regElems);
 
   // Submit an async registration request to the global cache.
   // The registration will be handled by the asyncRegThread_.
@@ -385,11 +427,59 @@ class RegCache {
   // Used by test only.
   void waitAsyncRegComplete();
 
+  // Global API to register all cached segments. This is useful in lazy
+  // registration mode where segments are cached but not immediately registered.
+  // Instead of registering each segment individually via
+  // searchRegHandle/regRange, this function discovers all contiguous memory
+  // regions among the cached segments and registers each region separately.
+  //
+  // This function does NOT assume all cached segments form a single
+  // contiguous region. It finds ALL contiguous regions (which may be
+  // non-adjacent in memory) and creates one registration per region.
+  //
+  // The function:
+  // 1. Retrieves all cached segments from the AVL tree
+  // 2. Sorts segments by starting address
+  // 3. Groups adjacent segments into contiguous regions (where one segment's
+  //    end address equals the next segment's start address)
+  // 4. Registers each contiguous region separately
+  //
+  // Example: If segments are at addresses [0x1000-0x2000], [0x2000-0x3000],
+  // [0x5000-0x6000], this creates TWO registrations:
+  //   - Region 1: [0x1000-0x3000] (first two segments are contiguous)
+  //   - Region 2: [0x5000-0x6000] (third segment is isolated)
+  //
+  // This function does NOT check for existing registrations.
+  // Callers should call deregAll() before regAll() if they want to avoid
+  // duplicate registrations.
+  //
+  // Returns commSuccess if successful, or error code otherwise.
+  static commResult_t regAll();
+
+  // Deregister all non-dynamic registration elements from the global cache.
+  // This removes all registrations that were created via regAll() or
+  // regRange(), but does NOT remove the cached segments themselves (they can be
+  // re-registered later). Dynamic registrations (created via regDynamic) are
+  // not affected.
+  //
+  // Returns commSuccess if successful, or error code otherwise.
+  static commResult_t deregAll();
+
   // Profiler to record the events of the global cache.
   // Check its APIs for more details.
   folly::Synchronized<regcache::Profiler> profiler;
 
  private:
+  // Hold a reference to CtranIbSingleton to ensure proper destruction order.
+  // By holding this shared_ptr, we guarantee CtranIbSingleton stays alive
+  // as long as RegCache exists, preventing use-after-free during
+  // deregistration.
+  std::shared_ptr<CtranIbSingleton> ibSingleton_;
+
+  // Global backends configuration, initialized from NCCL_CTRAN_BACKENDS in
+  // init().
+  std::vector<bool> globalBackends_;
+
   // AVL tree based segment cache
   folly::Synchronized<CtranAvlTree> segmentsAvl_;
   class RegElemMaps {
@@ -421,6 +511,22 @@ class RegCache {
 
   // Thread-safe function to search given <ptr, len> range in regElem cache.
   regcache::RegElem* searchRegElem(const void* ptr, const size_t len);
+
+  // Helper function to perform backend registration for a set of segments.
+  // Creates a RegElem, registers with backends, and updates regElemsMaps.
+  // Caller must hold segmentsAvl lock (for thread safety with segment
+  // pointers). This function acquires regElemsMaps_ lock internally.
+  //
+  // Returns commSuccess on success, or error code on failure.
+  // On success, *regHdl is set to the created RegElem pointer.
+  commResult_t registerSegmentsTogether(
+      void* ptr,
+      size_t len,
+      int cudaDev,
+      std::vector<regcache::Segment*>& segments,
+      const std::vector<bool>& backends,
+      bool ncclManaged,
+      regcache::RegElem** regHdl);
 
   commResult_t deregElem(regcache::RegElem* regElem);
 };

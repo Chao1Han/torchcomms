@@ -1,6 +1,7 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 
 #include "comms/common/AtomicUtils.cuh"
+#include "comms/ctran/algos/AllGather/Types.h"
 #include "comms/ctran/algos/DevCommon.cuh"
 #include "comms/ctran/algos/common/GpeKernelDev.cuh"
 // FIXME [REBASE]: update the path once moved to fbcode/comms
@@ -9,7 +10,7 @@
 __global__ void CtranGpeTestKernel(
     int* flag,
     CtranAlgoDeviceState* devState_d,
-    CtranKernelAllGatherArgs args) {
+    ctran::allgather::KernelArgs args) {
   int* a = const_cast<int*>(reinterpret_cast<const int*>(args.sendbuff));
   int* expValInt = reinterpret_cast<int*>(args.recvbuff);
   // Assume data type = commInt8
@@ -52,7 +53,7 @@ __global__ void CtranGpeTestStartAndExitKernel(int* flag) {
 __global__ void CtranGpeTestKElemsKernel(
     int* flag,
     CtranAlgoDeviceState* devState_d,
-    CtranKernelAllGatherArgs args) {
+    ctran::allgather::KernelArgs args) {
   KernelElem* elemList = const_cast<KernelElem*>(
       reinterpret_cast<const KernelElem*>(args.sendbuff));
   KernelElem* elem = elemList;
@@ -68,7 +69,7 @@ __global__ void CtranGpeTestKElemsKernel(
 __global__ void CtranGpeTestOneFlagKernel(
     int* flag,
     CtranAlgoDeviceState* devState_d,
-    CtranKernelAllGatherArgs args) {
+    ctran::allgather::KernelArgs args) {
   auto gtIdx = blockIdx.x * blockDim.x + threadIdx.x;
   if (flag && gtIdx == 0) {
     ctran::device::KernelStartGpe(flag);
@@ -84,7 +85,7 @@ __global__ void CtranGpeTestOneFlagKernel(
 __global__ void CtranGpeTestPerBlockFlagKernel(
     int* flag,
     CtranAlgoDeviceState* devState_d,
-    CtranKernelAllGatherArgs args) {
+    ctran::allgather::KernelArgs args) {
   auto tId = threadIdx.x;
   auto bId = blockIdx.x;
   if (flag && tId == 0) {
@@ -184,43 +185,4 @@ __global__ void CtranGpeTestFtShmAbortKernel(
   if (flag && tId == 0) {
     ctran::device::KernelWaitGpeTerminate(&flag[bId]);
   }
-}
-
-__global__ void CtranGpeTestFtKernelSkipGpeStart(
-    int* flag,
-    CtranAlgoDeviceState* devState_d,
-    CtranKernelFtArgs args) {
-  const auto tId = threadIdx.x;
-  const auto bId = blockIdx.x;
-
-  // From Gpe Thread perspective, this kernel does not start Host AlgoFn.
-
-  devStateLoadToShm(&flag[bId], devState_d);
-
-  while (!ctran::device::KernelTestHostAbortBlock(&flag[bId]))
-    ;
-
-  __syncthreads();
-  if (flag && tId == 0) {
-    ctran::device::KernelWaitGpeTerminate(&flag[bId]);
-  }
-}
-
-__global__ void CtranGpeTestFtKernelSkipGpeTerminate(
-    int* flag,
-    CtranAlgoDeviceState* devState_d,
-    CtranKernelFtArgs args) {
-  const auto tId = threadIdx.x;
-  const auto bId = blockIdx.x;
-  if (flag && tId == 0) {
-    ctran::device::KernelStartGpe(&flag[bId]);
-  }
-
-  devStateLoadToShm(&flag[bId], devState_d);
-
-  while (!ctran::device::KernelTestHostAbortBlock(&flag[bId]))
-    ;
-
-  // From Host perspective, this kernel does not free KernelFlag. Ctran Fault
-  // Tolerance use that as a signal to understand Device Kernel termination.
 }

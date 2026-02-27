@@ -14,11 +14,21 @@
 #include <memory>
 #include <vector>
 
-namespace torch {
-namespace comms {
+namespace torch::comms {
 
 inline constexpr const char* TORCHCOMM_BACKEND_ABI_VERSION = "1.0";
 
+/**
+ * TorchCommBackend - Abstract base class for communication backends.
+ *
+ * Thread Safety:
+ * TorchCommBackend implementations are NOT thread-safe. All operations
+ * (collectives, point-to-point, split, finalize, etc.) must be serialized
+ * by the caller.
+ *
+ * Internal threads (e.g., timeout watchdog) are properly synchronized with
+ * the main thread using mutexes and condition variables.
+ */
 class TorchCommBackend {
  public:
   virtual ~TorchCommBackend() = default;
@@ -148,13 +158,78 @@ class TorchCommBackend {
   virtual const CommOptions& getOptions() const = 0;
 
   virtual const at::Device& getDevice() const = 0;
-  // Window & One-sidede Operations, not required for all backends, so we added
+  // Window & One-sided Operations, not required for all backends, so we added
   // default implementation here
-  virtual std::shared_ptr<TorchCommWindow> new_window() {
+  virtual std::shared_ptr<TorchCommWindow> new_window(
+      [[maybe_unused]] const std::optional<at::Tensor>& tensor = std::nullopt) {
     throw std::logic_error(
         "[TorchCommBackend]: new_window not implemented for communicator:" +
         std::string(getCommName()));
-    return nullptr;
+  }
+
+  // Abort hook support - called before aborting when a collective times out or
+  // fails. This allows users to capture debug information before the abort.
+  // Multiple hooks can be registered and will be called in order.
+  using AbortHook = std::function<void()>;
+
+  virtual void registerAbortHook(int64_t hookId, AbortHook hook) {
+    abortHooks_.emplace(hookId, std::move(hook));
+  }
+
+  virtual void unregisterAbortHook(int64_t hookId) {
+    abortHooks_.erase(hookId);
+  }
+
+  std::unordered_map<int64_t, AbortHook> abortHooks_;
+
+  // Persistent AllGather operations
+  // Handle type for persistent AllGather (opaque pointer)
+  using AllGatherPHandle = void*;
+
+  // Initialize persistent AllGather operation
+  // Returns a handle that can be used for multiple executions
+  virtual AllGatherPHandle all_gather_p_init(
+      at::Tensor& /* output */,
+      const AllGatherPInitOptions& /* options */ = {}) {
+    throw std::logic_error(
+        "[TorchCommBackend]: all_gather_p_init not implemented for "
+        "communicator:" +
+        std::string(getCommName()));
+  }
+
+  // Execute persistent AllGather
+  // Can be called multiple times with the same handle
+  virtual c10::intrusive_ptr<TorchWork> all_gather_p_exec(
+      AllGatherPHandle /* handle */,
+      const at::Tensor& /* input */,
+      bool /* async_op */,
+      const AllGatherPExecOptions& /* options */ = {}) {
+    throw std::logic_error(
+        "[TorchCommBackend]: all_gather_p_exec not implemented for "
+        "communicator:" +
+        std::string(getCommName()));
+  }
+
+  // Free persistent AllGather handle
+  virtual void all_gather_p_free(AllGatherPHandle /* handle */) {
+    throw std::logic_error(
+        "[TorchCommBackend]: all_gather_p_free not implemented for "
+        "communicator:" +
+        std::string(getCommName()));
+  }
+
+ protected:
+  void runAbortHooks() {
+    for (const auto& [_, hook] : abortHooks_) {
+      try {
+        hook();
+      } catch (const std::exception& e) {
+        LOG(ERROR) << "[TorchCommBackend] Abort hook threw exception: "
+                   << e.what();
+      } catch (...) {
+        LOG(ERROR) << "[TorchCommBackend] Abort hook threw unknown exception.";
+      }
+    }
   }
 };
 
@@ -172,5 +247,4 @@ struct DynamicLoaderInterface {
 // Factory function signature (implemented in each .so)
 using CreateDynamicLoaderFn = DynamicLoaderInterface (*)();
 
-} // namespace comms
-} // namespace torch
+} // namespace torch::comms

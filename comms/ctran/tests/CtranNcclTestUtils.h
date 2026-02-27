@@ -33,27 +33,13 @@ namespace ctran {
 #endif // !defined(USE_ROCM)
 
 // ============================================================================
-// NCCL-Specific Memory Allocation Helpers
+// NCCL-Specific Memory Helpers
 // ============================================================================
 
 #if !defined(USE_ROCM)
 // Helper for freeing NCCL memory with reference count verification.
 // This ensures all internal handles have been properly released.
 ncclResult_t ncclMemFreeWithRefCheck(void* ptr);
-
-// Wrapper for ncclMemAllocDisjoint that calls commMemAllocDisjoint
-// and converts the result to ncclResult_t.
-ncclResult_t ncclMemAllocDisjoint(
-    void** ptr,
-    std::vector<size_t>& disjointSegmentSizes,
-    std::vector<TestMemSegment>& segments,
-    bool setRdmaSupport = true);
-
-// Wrapper for ncclMemFreeDisjoint that calls commMemFreeDisjoint
-// and converts the result to ncclResult_t.
-ncclResult_t ncclMemFreeDisjoint(
-    void* ptr,
-    std::vector<size_t>& disjointSegmentSizes);
 #endif // !defined(USE_ROCM)
 
 // ============================================================================
@@ -70,18 +56,26 @@ class CtranNcclTestHelpers : public CtranTestHelpers {
   CtranNcclTestHelpers() = default;
 
   // Prepare buffer with specified memory type.
-  // Extends base class to support NCCL memory allocation types:
-  // - kMemCudaMalloc: Uses cudaMalloc (handled by base class)
+  // Supports NCCL memory allocation types:
+  // - kMemCudaMalloc: Uses cudaMalloc
   // - kMemNcclMemAlloc: Uses ncclMemAlloc
-  // - kCuMemAllocDisjoint: Uses ncclMemAllocDisjoint
+  // - kCuMemAllocDisjoint: Uses commMemAllocDisjoint directly
+  // For kCuMemAllocDisjoint, numSegments specifies how many disjoint physical
+  // segments to allocate (default: 2).
   static void* prepareBuf(
       size_t bufSize,
       MemAllocType memType,
-      std::vector<TestMemSegment>& segments);
+      std::vector<TestMemSegment>& segments,
+      size_t numSegments = 2);
 
   // Release buffer allocated by prepareBuf.
-  // Extends base class to support NCCL memory types.
-  static void releaseBuf(void* buf, size_t bufSize, MemAllocType memType);
+  // For kCuMemAllocDisjoint, numSegments must match the value used in
+  // prepareBuf.
+  static void releaseBuf(
+      void* buf,
+      size_t bufSize,
+      MemAllocType memType,
+      size_t numSegments = 2);
 };
 
 } // namespace ctran

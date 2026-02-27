@@ -7,9 +7,7 @@
 
 #include "comms/torchcomms/rccl/RcclApi.hpp"
 
-namespace torch {
-namespace comms {
-namespace test {
+namespace torch::comms::test {
 
 class RcclMock : public RcclApi {
  public:
@@ -171,6 +169,7 @@ class RcclMock : public RcclApi {
   MOCK_METHOD(ncclResult_t, groupStart, (), (override));
   MOCK_METHOD(ncclResult_t, groupEnd, (), (override));
   MOCK_METHOD(const char*, getErrorString, (ncclResult_t result), (override));
+  MOCK_METHOD(std::string, getLastError, (ncclComm_t comm), (override));
   MOCK_METHOD(
       ncclResult_t,
       redOpCreatePreMulSum,
@@ -190,6 +189,4 @@ class RcclMock : public RcclApi {
   void setupDefaultBehaviors();
 };
 
-} // namespace test
-} // namespace comms
-} // namespace torch
+} // namespace torch::comms::test

@@ -25,7 +25,8 @@ void testSend(
     int numBlocks,
     int blockSize,
     GroupType groupType = GroupType::WARP,
-    int blocksPerGroup = 1);
+    int blocksPerGroup = 1,
+    cudaStream_t stream = nullptr);
 
 void testRecv(
     P2pNvlTransportDevice p2p,
@@ -34,7 +35,8 @@ void testRecv(
     int numBlocks,
     int blockSize,
     GroupType groupType = GroupType::WARP,
-    int blocksPerGroup = 1);
+    int blocksPerGroup = 1,
+    cudaStream_t stream = nullptr);
 
 // Multiple sequential sends within a single kernel
 void testMultiSend(
@@ -104,6 +106,28 @@ void testWeightedRecvSend(
     int blockSize,
     uint32_t recvWeight,
     uint32_t sendWeight,
+    GroupType groupType = GroupType::WARP);
+
+// Test put() - one-sided direct memory write to peer GPU and signal peer
+// Unlike send()/recv(), put() writes directly to dst_d without staging buffers
+void testPutWithSignal(
+    P2pNvlTransportDevice p2p,
+    char* dst_d, // Destination on peer GPU (must be NVLink-accessible)
+    const char* src_d, // Source on local GPU
+    uint64_t signal_id,
+    size_t nbytes,
+    int numBlocks,
+    int blockSize,
+    GroupType groupType = GroupType::WARP);
+
+// Test wait() - one-sided wait for peer to write to dst_d and signal
+void testWait(
+    P2pNvlTransportDevice p2p,
+    CmpOp op,
+    uint64_t signal_id,
+    uint64_t expected,
+    int numBlocks,
+    int blockSize,
     GroupType groupType = GroupType::WARP);
 
 } // namespace comms::pipes::test

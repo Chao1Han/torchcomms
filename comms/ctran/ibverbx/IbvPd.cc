@@ -1,6 +1,7 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 
 #include "comms/ctran/ibverbx/IbvPd.h"
+#include "comms/ctran/ibverbx/IbvVirtualCq.h"
 #include "comms/ctran/ibverbx/IbverbxSymbols.h"
 
 namespace ibverbx {
@@ -80,6 +81,9 @@ folly::Expected<IbvMr, Error> IbvPd::regDmabufMr(
     ibv_access_flags access) const {
   ibv_mr* mr;
   if (dataDirect_) {
+    if (ibvSymbols.mlx5dv_internal_reg_dmabuf_mr == nullptr) {
+      return folly::makeUnexpected(Error(ENOSYS));
+    }
     mr = ibvSymbols.mlx5dv_internal_reg_dmabuf_mr(
         pd_,
         offset,
@@ -89,6 +93,9 @@ folly::Expected<IbvMr, Error> IbvPd::regDmabufMr(
         access,
         MLX5DV_REG_DMABUF_ACCESS_DATA_DIRECT);
   } else {
+    if (ibvSymbols.ibv_internal_reg_dmabuf_mr == nullptr) {
+      return folly::makeUnexpected(Error(ENOSYS));
+    }
     mr = ibvSymbols.ibv_internal_reg_dmabuf_mr(
         pd_, offset, length, iova, fd, access);
   }
@@ -111,27 +118,21 @@ folly::Expected<IbvQp, Error> IbvPd::createQp(
 folly::Expected<IbvVirtualQp, Error> IbvPd::createVirtualQp(
     int totalQps,
     ibv_qp_init_attr* initAttr,
-    IbvVirtualCq* sendCq,
-    IbvVirtualCq* recvCq,
+    IbvVirtualCq* virtualCq,
     int maxMsgCntPerQp,
     int maxMsgSize,
     LoadBalancingScheme loadBalancingScheme) const {
   std::vector<IbvQp> qps;
   qps.reserve(totalQps);
 
-  if (sendCq == nullptr) {
+  if (virtualCq == nullptr) {
     return folly::makeUnexpected(
-        Error(EINVAL, "Empty sendCq being provided to createVirtualQp"));
-  }
-
-  if (recvCq == nullptr) {
-    return folly::makeUnexpected(
-        Error(EINVAL, "Empty recvCq being provided to createVirtualQp"));
+        Error(EINVAL, "Empty virtualCq being provided to createVirtualQp"));
   }
 
   // Overwrite the CQs in the initAttr to point to the virtual CQ
-  initAttr->send_cq = sendCq->getPhysicalCqsRef().at(0).cq();
-  initAttr->recv_cq = recvCq->getPhysicalCqsRef().at(0).cq();
+  initAttr->send_cq = virtualCq->getPhysicalCqsRef().at(0).cq();
+  initAttr->recv_cq = virtualCq->getPhysicalCqsRef().at(0).cq();
 
   // First create all the data QPs
   for (int i = 0; i < totalQps; i++) {
@@ -142,22 +143,69 @@ folly::Expected<IbvVirtualQp, Error> IbvPd::createVirtualQp(
     qps.emplace_back(std::move(*maybeQp));
   }
 
-  // Create notify QP
-  auto maybeNotifyQp = createQp(initAttr);
-  if (maybeNotifyQp.hasError()) {
-    return folly::makeUnexpected(maybeNotifyQp.error());
+  // Create notify QP when using multiple data QPs, to support all
+  // load balancing schemes that may require it (e.g., SPRAY)
+  std::optional<IbvQp> notifyQp;
+  if (totalQps > 1) {
+    auto maybeNotifyQp = createQp(initAttr);
+    if (maybeNotifyQp.hasError()) {
+      return folly::makeUnexpected(maybeNotifyQp.error());
+    }
+    notifyQp = std::move(*maybeNotifyQp);
   }
 
-  // Create the IbvVirtualQp instance, with coordinator registartion happens
+  // Create the IbvVirtualQp instance, with registration happening
   // within IbvVirtualQp constructor
   return IbvVirtualQp(
       std::move(qps),
-      std::move(*maybeNotifyQp),
-      sendCq,
-      recvCq,
+      virtualCq,
       maxMsgCntPerQp,
       maxMsgSize,
-      loadBalancingScheme);
+      loadBalancingScheme,
+      std::move(notifyQp));
+}
+
+folly::Expected<IbvSrq, Error> IbvPd::createSrq(
+    ibv_srq_init_attr* srqInitAttr) const {
+  if (ibvSymbols.ibv_internal_create_srq == nullptr) {
+    return folly::makeUnexpected(Error(ENOSYS));
+  }
+
+  ibv_srq* srq;
+  srq = ibvSymbols.ibv_internal_create_srq(pd_, srqInitAttr);
+  if (!srq) {
+    return folly::makeUnexpected(Error(errno));
+  }
+  return IbvSrq(srq);
+}
+
+folly::Expected<IbvAh, Error> IbvPd::createAh(ibv_ah_attr* ahAttr) const {
+  ibv_ah* ah;
+  ah = ibvSymbols.ibv_internal_create_ah(pd_, ahAttr);
+  if (!ah) {
+    return folly::makeUnexpected(Error(errno));
+  }
+  return IbvAh(ah);
+}
+
+folly::Expected<IbvQp, Error> IbvPd::createDcQp(
+    ibv_qp_init_attr_ex* initAttrEx,
+    mlx5dv_qp_init_attr* mlx5InitAttr) const {
+  if (!ibvSymbols.mlx5dv_internal_create_qp) {
+    return folly::makeUnexpected(
+        Error(ENOTSUP, "mlx5dv_create_qp not available"));
+  }
+
+  // Set the PD in the extended attributes
+  initAttrEx->pd = pd_;
+
+  ibv_qp* qp;
+  qp = ibvSymbols.mlx5dv_internal_create_qp(
+      pd_->context, initAttrEx, mlx5InitAttr);
+  if (!qp) {
+    return folly::makeUnexpected(Error(errno));
+  }
+  return IbvQp(qp, deviceId_);
 }
 
 } // namespace ibverbx

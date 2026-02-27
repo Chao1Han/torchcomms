@@ -1,10 +1,8 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 
 #include "comms/torchcomms/nccl/TorchCommNCCLCCA.hpp"
-#include <mutex>
 
-namespace torch {
-namespace comms {
+namespace torch::comms {
 
 // Global function to be registered as a hook
 void cachingAllocatorHookFn(
@@ -14,15 +12,9 @@ void cachingAllocatorHookFn(
 }
 
 CachingAllocatorHookImpl& CachingAllocatorHook::getInstance() {
-  // Create a static instance of the class based on the first call.
-  // This allows threads to override the device type if needed.
-  if (!instance_) {
-    static std::mutex init_mutex;
-    std::lock_guard<std::mutex> lock(init_mutex);
-    if (!instance_) {
-      createInstance();
-    }
-  }
+  // Use std::call_once for thread-safe singleton initialization
+  // NOLINTNEXTLINE(facebook-hte-std::call_once)
+  std::call_once(init_flag_, createInstance);
   return *instance_;
 }
 
@@ -150,5 +142,4 @@ bool CachingAllocatorHookImpl::isCommRegistered(TorchCommNCCL* comm) {
   return registeredComms_.contains(comm);
 }
 
-} // namespace comms
-} // namespace torch
+} // namespace torch::comms

@@ -4,7 +4,7 @@
 
 from datetime import timedelta
 from enum import auto, Enum
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List
 
 class RedOpType(Enum):
     SUM = auto()
@@ -30,6 +30,54 @@ class ReduceOp:
     def PREMUL_SUM(factor: Any) -> ReduceOp: ...
     @property
     def type(self) -> RedOpType: ...
+
+class OpName(Enum):
+    """Collective operation name for hooks."""
+
+    send = auto()
+    recv = auto()
+    broadcast = auto()
+    all_reduce = auto()
+    reduce = auto()
+    all_gather = auto()
+    all_gather_v = auto()
+    all_gather_single = auto()
+    reduce_scatter = auto()
+    reduce_scatter_v = auto()
+    reduce_scatter_single = auto()
+    all_to_all_single = auto()
+    all_to_all_v_single = auto()
+    all_to_all = auto()
+    barrier = auto()
+    scatter = auto()
+    gather = auto()
+    split = auto()
+    new_window = auto()
+
+class RemovableHandle:
+    """Handle for removing a registered hook."""
+
+    def remove(self) -> None: ...
+
+class PreHookArgs:
+    """Arguments passed to pre-hook callbacks."""
+
+    @property
+    def name(self) -> OpName: ...
+    @property
+    def async_op(self) -> bool: ...
+    @property
+    def root(self) -> int: ...
+    @property
+    def op_id(self) -> int: ...
+
+class PostHookArgs:
+    """Arguments passed to post-hook callbacks."""
+
+    @property
+    def name(self) -> OpName: ...
+    @property
+    def op_id(self) -> int: ...
 
 class CommOptions:
     abort_process_on_timeout_or_error: bool
@@ -119,21 +167,40 @@ class GatherOptions:
     timeout: timedelta
     hints: Dict[str, str]
 
+class AllGatherPInitOptions:
+    def __init__(self) -> None: ...
+    timeout: timedelta
+    hints: Dict[str, str]
+
+class AllGatherPExecOptions:
+    def __init__(self) -> None: ...
+    timeout: timedelta
+    hints: Dict[str, str]
+
+# Opaque handle type for persistent AllGather
+AllGatherPHandle = Any
+
 class TorchWork:
     def is_completed(self) -> bool: ...
     def wait(self) -> None: ...
 
-class TorchCommlWinAccessType(Enum):
+class TorchCommWinAccessType(Enum):
     WIN_ACCESS_TYPE_UNIFIED = auto()
     WIN_ACCESS_TYPE_SEPARATE = auto()
 
 class TorchCommWindowAttr:
     def __init__(self) -> None: ...
-    access_type: TorchCommlWinAccessType
+    access_type: TorchCommWinAccessType
 
 class TorchCommWindow:
+    @property
+    def dtype(self) -> Any: ...
+    @property
+    def shape(self) -> List[int]: ...
+    @property
+    def device(self) -> Any: ...
     def get_size(self) -> int: ...
-    def get_device(self) -> Any: ...
+    def get_tensor(self) -> Any | None: ...
     def tensor_register(
         self,
         tensor: Any,
@@ -347,9 +414,34 @@ class TorchComm:
         timeout: timedelta | None = None,
     ) -> TorchComm: ...
     def batch_op_create(self) -> BatchSendRecv: ...
-    def new_window(self) -> TorchCommWindow: ...
+    def new_window(self, tensor: Any | None = None) -> TorchCommWindow: ...
+    def all_gather_p_init(
+        self,
+        output: Any,
+        hints: Dict[str, str] | None = None,
+        timeout: timedelta | None = None,
+    ) -> AllGatherPHandle: ...
+    def all_gather_p_exec(
+        self,
+        handle: AllGatherPHandle,
+        input: Any,
+        async_op: bool,
+        hints: Dict[str, str] | None = None,
+        timeout: timedelta | None = None,
+    ) -> TorchWork: ...
+    def all_gather_p_free(
+        self,
+        handle: AllGatherPHandle,
+    ) -> None: ...
     @property
     def mem_allocator(self) -> Any: ...
+    def register_pre_hook(
+        self, callback: Callable[[PreHookArgs], None]
+    ) -> RemovableHandle: ...
+    def register_post_hook(
+        self, callback: Callable[[PostHookArgs], None]
+    ) -> RemovableHandle: ...
+    def register_abort_hook(self, callback: Callable[[], None]) -> RemovableHandle: ...
 
 def new_comm(
     backend: str,

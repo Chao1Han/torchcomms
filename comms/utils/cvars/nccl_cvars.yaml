@@ -5,7 +5,7 @@
 # file by including `nccl_cvars.h` and use typed CVAR by its name.
 #
 # Developer Notes
-# - Execute `cd ~/fbsource/fbcode && buck2 run comms/utils/cvars:extractcvars` to auto generate cvar code
+# - Execute `cd ~/fbsource/fbcode && NCCL_CVARS_OUTPUT_DIR=comms/utils/cvars buck2 run comms/utils/cvars:extractcvars` to auto generate cvar code
 #
 cvars:
  - name        : NCCL_CVARS_LOG_INFO
@@ -625,6 +625,16 @@ cvars:
    default     : ""
    description : https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html#nccl-net-force-merge
 
+ - name        : NCCL_TOPO_BOND_V228
+   type        : bool
+   default     : true
+   description : |-
+     Controls v2.27 vs v2.28 topology behavior for bonded vNics.
+     When true (default, v2.28 behavior): enables PCI link widening,
+     uses current tuning constants, and uses GPU-based inter logic.
+     When false (v2.27-like): disables PCI link widening, doubles
+     Blackwell per-channel tuning bandwidths, and uses NET node
+     count for system->inter.
 
  - name        : NCCL_NTHREADS
    type        : int64_t
@@ -1427,6 +1437,14 @@ cvars:
      staging buffer / minimum chunk size). The size of per-peer ChunkState buffer
      is CTRAN_P2P_NVL_DEVMEM_MAX_CHUNKS * sizeof(ChunkState)=128*128=16KB
 
+ - name        : NCCL_CTRAN_P2P_NVL_COPY_PIPELINE_DEPTH
+   type        : size_t
+   default     : 2
+   description : |-
+     Pipeline depth for NVL P2P copy-based kernel. This value controls the
+     number of pipeline stages used for data transfer operations between
+     NVLink peers.
+
  - name        : NCCL_CTRAN_BCAST_NVL_SHARED_DEVBUF_SIZE
    type        : uint64_t
    default     : 33554432
@@ -1696,6 +1714,15 @@ cvars:
      Usage: If the config is "ib, nvl, socket", the backend tries to enable
      ib first. If the ib initialization fails, the backend will enable socket.
 
+ - name        : NCCL_CTRAN_IPC_REGCACHE_ENABLE_ASYNC_SOCKET
+   type        : bool
+   default     : false
+   description : |-
+     Enable the IpcRegCache async socket server and peer address exchange for
+     NVL remote memory release notifications. When disabled, the NVL backend
+     still works for window-based operations (which use the IB/Socket control
+     channel).
+
  - name        : NCCL_CTRAN_PROFILING_REPORT_COUNT
    type        : int
    default     : 100
@@ -1896,13 +1923,14 @@ cvars:
  - name        : NCCL_SENDRECV_ALGO
    type        : enum
    default     : orig
-   choices     : orig, ctran, ctzcopy, ctstaged
+   choices     : orig, ctran, ctzcopy, ctstaged, ctp2p
    description : |-
      The algorithm to use for sendrecv communication
      orig - Copy-based communication
      ctran - Ctran-based communication auto-select
      ctzcopy - Ctran-based zero-copy kernel for NVL
      ctstaged - Ctran-based staged-copy kernel for NVL
+     ctp2p - Experimental algo: Ctran-based point-to-point kernel for NVL
 
  - name        : NCCL_ALLGATHER_P_ALGO
    type        : enum
@@ -1937,6 +1965,14 @@ cvars:
      ctdirect - Ctran-based direct point-to-point algorithm
      ctring - Ctran-based rail ring algorithm for inter-node only case
      ctrhd - Ctran-based recursive vector-halving distance-doubling algorithm
+
+ - name        : NCCL_REDUCESCATTER_PAT_AVG_ENABLE
+   type        : bool
+   default     : false
+   description : |-
+     Enable PAT algorithm with native AVG support for ReduceScatter operations.
+     When enabled, ReduceScatter with ncclAvg uses FuncPatAvg for true floating-point
+     division instead of FuncSumPostDiv (which only supports unsigned integers).
 
  - name        : NCCL_ALLTOALL_ALGO
    type        : enum
@@ -2145,6 +2181,8 @@ cvars:
      of the following features. Leave empty to disable all features.
      verbose - print every completed event as NCCL INFO log. Mostly for debug.
      trace - Just enable collective trace.
+     algostat - lightweight algorithm counting (no CUDA events/worker thread).
+                Use ncclx::colltrace::dumpAlgoStat(comm) to retrieve stats.
 
  - name        : NCCL_COLLTRACE_USE_NEW_COLLTRACE
    type        : bool
@@ -2351,13 +2389,12 @@ cvars:
  - name        : NCCL_ALLREDUCE_ALGO
    type        : enum
    default     : orig
-   choices     : orig, ctran, ctdirect, ctarg, ctring
+   choices     : orig, ctran, ctdirect, ctring
    description : |-
      The algorithm to use for Allreduce communication
      orig - Copy-based algorithm
      ctran - Picks the best ctran-based algorithm
      ctdirect - Ctran-based direct point-to-point algorithm
-     ctarg - ctran-based direct alltoall + reduce + all gather algorithm
      ctring - ctran-based ring algorithm
 
  - name        : NCCL_ALLREDUCE_TYPE
@@ -2718,7 +2755,7 @@ cvars:
 
  - name        : NCCL_CTRAN_ALLREDUCE_RING_TMPBUF_CHUNK_SIZE
    type        : uint64_t
-   default     : 8388608
+   default     : 0
    description : |-
      size in bytes of each chunk for temporary send and receive buffers used in
      NCCL CTRAN allreduce ring. The size of each temporary buffer is
@@ -2726,7 +2763,7 @@ cvars:
 
  - name        : NCCL_CTRAN_ALLREDUCE_RING_TMPBUF_NUM_CHUNKS
    type        : uint32_t
-   default     : 4
+   default     : 0
    description : |-
      number of chunks allocated for temporary send and receive buffers used in
      NCCL CTRAN allreduce ring. The size of each temporary buffer is
@@ -2741,7 +2778,7 @@ cvars:
 
  - name        : NCCL_CTRAN_ALLREDUCE_RING_MAX_NUM_THREAD_BLOCKS
    type        : int
-   default     : 2
+   default     : 0
    description : |-
      Maximum number of thread blocks used for the AllReduce kernel.
      We might use fewer thread blocks, if we can achieve max occupancy
@@ -2749,10 +2786,31 @@ cvars:
 
  - name        : NCCL_CTRAN_ALLREDUCE_RING_THREAD_BLOCK_SIZE
    type        : int
-   default     : 512
+   default     : 0
    description : |-
      Number of threads in each thread block used for the AllReduce
-     kernel. Default -1 to use the recommended size by CUDA runtime.
+     kernel.
+
+ - name        : NCCL_CTRAN_ALLREDUCE_RING_AUTO_TUNE_MAX_BDP
+   type        : int
+   default     : 0
+   description : |-
+     Enable auto-tuning of AllReduceRing parameters based on message size.
+     When enabled, overrides MAX_NUM_THREAD_BLOCKS and pipeline parameters
+     with per-message-size optimal values. Set to 0 to use static CVAR
+     values instead.
+
+ - name        : NCCL_CTRAN_ALLREDUCE_RING_BIDIR_AG_MAX_SIZE
+   type        : int64_t
+   default     : 4194304
+   description : |-
+     Maximum message size in bytes for bi-directional AllGather optimization
+     in AllReduceRing. Bi-directional AG sends data in both directions
+     simultaneously during the AllGather phase, reducing total steps.
+     Set to 0 to disable bi-directional AG entirely.
+     Set to -1 to enable for all message sizes.
+     Set to a positive value to enable only for messages up to that size
+     (default: 4194304 bytes / 4MB).
 
  - name        : NCCL_CTRAN_ENABLE_FAULT_TOLERANCE
    type        : bool
@@ -2776,6 +2834,29 @@ cvars:
      backends specified by NCCL_CTRAN_BACKENDS.
      Usage: If the NCCL_CTRAN_BACKENS is set with certain values,
      this config will allow MCCL to override backends.
+
+ - name        : MCCL_SCUBA_ENABLED
+   type        : bool
+   default     : false
+   description : |-
+     Enable MCCL Scuba structured logging. When enabled, MCCL will log
+     events to dedicated MCCL Scuba tables for observability and debugging.
+     This is separate from NCCLX logging to minimize risk.
+
+ - name        : MCCL_SCUBA_LOG_LEVEL
+   type        : enum
+   default     : HIGH
+   choices     : CRITICAL, HIGH, NORMAL, LOW
+   description : |-
+     Minimum log priority level for MCCL Scuba logging. Only logs at or above
+     this priority level will be forwarded to Scuba; lower-priority logs are
+     dropped. The priority levels from highest to lowest are:
+       CRITICAL - Critical logs only (e.g., errors, failures)
+       HIGH     - Critical and high-priority logs (e.g., important events)
+       NORMAL   - Critical, high, and normal logs (default operational logs)
+       LOW      - All logs including low-priority (verbose/debug)
+     For example, setting MCCL_SCUBA_LOG_LEVEL=HIGH means only HIGH and
+     CRITICAL priority logs will be forwarded to Scuba.
 
  - name        : NCCL_GIN_GDAKI_NIC_HANDLER
    type        : int

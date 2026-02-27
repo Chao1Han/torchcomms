@@ -5,15 +5,15 @@
 #include <chrono>
 #include <memory>
 #include <optional>
+#include <string_view>
 
 #include <ATen/ATen.h>
+#include <ATen/record_function.h>
 #include <hip_runtime.h> // @manual=third-party//cuda:cuda-lazy
 #include <vector>
-#include "comms/torchcomms/TorchCommTracing.hpp" // @manual=//comms/torchcomms:torchcomms-headers-cpp
 #include "comms/torchcomms/TorchWork.hpp" // @manual=//comms/torchcomms:torchcomms-headers-cpp
 
-namespace torch {
-namespace comms {
+namespace torch::comms {
 
 // Forward declaration
 class TorchCommRCCL;
@@ -24,14 +24,12 @@ class TorchWorkRCCL : public TorchWork {
       std::shared_ptr<TorchCommRCCL> comm,
       hipStream_t stream,
       std::chrono::milliseconds timeout_ms,
-      const std::vector<at::Tensor>& inputTensors,
-      std::shared_ptr<TorchCommTracing> tracing);
+      const std::vector<at::Tensor>& inputTensors);
   TorchWorkRCCL(
       std::shared_ptr<TorchCommRCCL> comm,
       hipStream_t stream,
       std::chrono::milliseconds timeout_ms,
-      const at::Tensor& inputTensor,
-      std::shared_ptr<TorchCommTracing> tracing);
+      const at::Tensor& inputTensor);
   ~TorchWorkRCCL() override;
 
   // We delete the copy constructor and assignment operator to prevent 2 work
@@ -41,27 +39,26 @@ class TorchWorkRCCL : public TorchWork {
   // Delete the move assignment operator to prevent accidentally stomping over
   // events if the work is in progress.
   TorchWorkRCCL& operator=(TorchWorkRCCL&& other) noexcept = delete;
-
-  // Move constructor
-  TorchWorkRCCL(TorchWorkRCCL&& other) noexcept;
+  TorchWorkRCCL(TorchWorkRCCL&&) = delete;
 
   // Override virtual functions from TorchWork
   void wait() override;
 
   // Check the status of the work object
   WorkStatus checkStatus();
-
-  std::chrono::milliseconds getTimeout() {
+  std::chrono::milliseconds getTimeout() const override {
     return timeout_ms_;
   }
 
  protected:
-  void recordStart();
+  void recordStart(std::string_view coll_name);
   void recordEnd();
 
   friend class TorchCommRCCL;
 
  private:
+  void recordFunctionStart(std::string_view coll_name);
+
   std::vector<at::Tensor> inputTensors_;
   at::Tensor inputTensor_;
 
@@ -73,8 +70,8 @@ class TorchWorkRCCL : public TorchWork {
   std::chrono::milliseconds timeout_ms_;
 
   std::optional<std::chrono::steady_clock::time_point> start_completed_time_;
-  std::shared_ptr<TorchCommTracing> tracing_;
+
+  std::optional<at::RecordFunction> recordFunction_;
 };
 
-} // namespace comms
-} // namespace torch
+} // namespace torch::comms

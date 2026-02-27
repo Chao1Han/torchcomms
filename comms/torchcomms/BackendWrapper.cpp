@@ -3,14 +3,26 @@
 #include "comms/torchcomms/BackendWrapper.hpp"
 #include "comms/torchcomms/TorchComm.hpp"
 
-namespace torch {
-namespace comms {
+#include <c10/core/DeviceGuard.h> // @manual=//caffe2:c10
+
+namespace torch::comms {
 
 namespace {
 
+// Extract the scaling factor from NCCL's PREMUL_SUM operation supplement.
+// NCCLPreMulSumSupplement stores either a tensor or double scaling factor
+// that is applied before summation.
 PreMulSumFactorT getPreMulSumFactor(const c10d::ReduceOp& op) {
+  TORCH_CHECK(
+      op.supplement_ != nullptr,
+      "PREMUL_SUM operation requires a supplement, but none was provided");
+
   const auto* preMulSupplement =
-      reinterpret_cast<c10d::NCCLPreMulSumSupplement*>(op.supplement_.get());
+      dynamic_cast<const c10d::NCCLPreMulSumSupplement*>(op.supplement_.get());
+  TORCH_CHECK(
+      preMulSupplement != nullptr,
+      "PREMUL_SUM operation supplement must be of type NCCLPreMulSumSupplement");
+
   if (preMulSupplement->tensor_factor.defined()) {
     return preMulSupplement->tensor_factor;
   }
@@ -51,17 +63,59 @@ std::vector<uint64_t> toVecUint64(const std::vector<int64_t>& vec) {
 
 } // namespace
 
-WorkWrapper::WorkWrapper(c10::intrusive_ptr<TorchWork> work)
-    : work_(std::move(work)) {}
+WorkWrapper::WorkWrapper(
+    c10::intrusive_ptr<TorchWork> work,
+    std::vector<at::Tensor> outputTensors)
+    : work_(std::move(work)), outputTensors_(std::move(outputTensors)) {
+  std::vector<c10::Device> devices;
+  // MTIA, CPU needs to wait for the TorchWork to complete before marking Future
+  // as completed
+  for (const auto& tensor : outputTensors_) {
+    if (tensor.device().type() != c10::DeviceType::CPU &&
+        tensor.device().type() != c10::DeviceType::MTIA) {
+      devices.push_back(tensor.device());
+      break;
+    }
+  }
+  future_ = c10::make_intrusive<c10::ivalue::Future>(
+      c10::ListType::create(c10::TensorType::get()), devices);
+
+  if (!devices.empty()) {
+    // CUDA: resolve immediately. Future records a CUDA event on the current
+    // stream via markCompleted(). Device guard ensures getCurrentStream()
+    // returns the correct device's stream.
+    c10::OptionalDeviceGuard guard(devices[0]);
+    future_->markCompleted(c10::IValue(outputTensors_));
+  } else if (work_->isCompleted()) {
+    // For other device types (CPU, MTIA etc.) synchronous op already finished —
+    // resolve now.
+    future_->markCompleted(c10::IValue(outputTensors_));
+  } else {
+    // For other device types (CPU, MTIA etc.) async: register callback so
+    // future completes when setStatus fires.
+    work_->setCallback([future = future_, tensors = outputTensors_]() {
+      if (!future->completed()) {
+        future->markCompleted(c10::IValue(tensors));
+      }
+    });
+  }
+}
 
 bool WorkWrapper::isCompleted() {
   return work_->isCompleted();
 }
 bool WorkWrapper::isSuccess() const {
-  // TODO: implement error states
+  // Note: Error state tracking is not implemented. This method returns
+  // isCompleted() as a simplification. The underlying TorchWork does not
+  // expose separate success/error states, so we assume completion implies
+  // success. Callers that need error detection should use try/catch around
+  // wait() instead.
   return work_->isCompleted();
 }
 std::exception_ptr WorkWrapper::exception() const {
+  // Note: Exception capture is not implemented. The underlying TorchWork
+  // interface does not provide a mechanism to retrieve exceptions after
+  // completion. Errors are raised during wait() calls instead.
   return nullptr;
 }
 bool WorkWrapper::wait(std::chrono::milliseconds timeout) {
@@ -69,14 +123,22 @@ bool WorkWrapper::wait(std::chrono::milliseconds timeout) {
     throw std::runtime_error("wait timeout not supported");
   }
   work_->wait();
+  if (!future_->completed()) {
+    future_->markCompleted(c10::IValue(outputTensors_));
+  }
   return true;
 }
 void WorkWrapper::synchronize() {
-  // TODO: this should only wait on stream
-  return work_->wait();
+  work_->wait();
+  if (!future_->completed()) {
+    future_->markCompleted(c10::IValue(outputTensors_));
+  }
 }
 std::vector<at::Tensor> WorkWrapper::result() {
-  return {};
+  return outputTensors_;
+}
+c10::intrusive_ptr<c10::ivalue::Future> WorkWrapper::getFuture() {
+  return future_;
 }
 
 BackendWrapper::BackendWrapper(std::shared_ptr<TorchComm> comm)
@@ -88,104 +150,160 @@ BackendWrapper::BackendWrapper(std::shared_ptr<TorchComm> comm)
 c10::intrusive_ptr<c10d::Work> BackendWrapper::broadcast(
     std::vector<at::Tensor>& tensors,
     const c10d::BroadcastOptions& opts) {
-  TORCH_INTERNAL_ASSERT(tensors.size() == 1, "Only single tensor supported");
+  TORCH_CHECK(
+      tensors.size() == 1,
+      "Only single tensor supported, but got ",
+      tensors.size(),
+      " tensors");
   BroadcastOptions bopts;
   if (opts.timeout != kUnsetTimeout) {
     bopts.timeout = opts.timeout;
+  } else {
+    bopts.timeout = options_->timeout;
   }
-  return c10::make_intrusive<WorkWrapper>(backend_->broadcast(
-      tensors.at(0), static_cast<int>(opts.rootRank), opts.asyncOp, bopts));
+  return c10::make_intrusive<WorkWrapper>(
+      backend_->broadcast(
+          tensors.at(0), static_cast<int>(opts.rootRank), opts.asyncOp, bopts),
+      tensors);
 }
 
 c10::intrusive_ptr<c10d::Work> BackendWrapper::allreduce(
     std::vector<at::Tensor>& tensors,
     const c10d::AllreduceOptions& opts) {
-  TORCH_INTERNAL_ASSERT(tensors.size() == 1, "Only single tensor supported");
+  TORCH_CHECK(
+      tensors.size() == 1,
+      "Only single tensor supported, but got ",
+      tensors.size(),
+      " tensors");
   AllReduceOptions bopts;
   if (opts.timeout != kUnsetTimeout) {
     bopts.timeout = opts.timeout;
+  } else {
+    bopts.timeout = options_->timeout;
   }
-  return c10::make_intrusive<WorkWrapper>(backend_->all_reduce(
-      tensors.at(0), toReduceOp(opts.reduceOp), opts.asyncOp, bopts));
+  return c10::make_intrusive<WorkWrapper>(
+      backend_->all_reduce(
+          tensors.at(0), toReduceOp(opts.reduceOp), opts.asyncOp, bopts),
+      tensors);
 }
 
 c10::intrusive_ptr<c10d::Work> BackendWrapper::allreduce_coalesced(
     std::vector<at::Tensor>& tensors,
     const c10d::AllreduceCoalescedOptions& opts) {
-  TORCH_INTERNAL_ASSERT(tensors.size() == 1, "Only single tensor supported");
+  TORCH_CHECK(
+      tensors.size() == 1,
+      "Only single tensor supported, but got ",
+      tensors.size(),
+      " tensors");
   AllReduceOptions bopts;
   if (opts.timeout != kUnsetTimeout) {
     bopts.timeout = opts.timeout;
+  } else {
+    bopts.timeout = options_->timeout;
   }
-  return c10::make_intrusive<WorkWrapper>(backend_->all_reduce(
-      tensors.at(0), toReduceOp(opts.reduceOp), opts.asyncOp, bopts));
+  return c10::make_intrusive<WorkWrapper>(
+      backend_->all_reduce(
+          tensors.at(0), toReduceOp(opts.reduceOp), opts.asyncOp, bopts),
+      tensors);
 }
 
 c10::intrusive_ptr<c10d::Work> BackendWrapper::reduce(
     std::vector<at::Tensor>& tensors,
     const c10d::ReduceOptions& opts) {
-  TORCH_INTERNAL_ASSERT(tensors.size() == 1, "Only single tensor supported");
+  TORCH_CHECK(
+      tensors.size() == 1,
+      "Only single tensor supported, but got ",
+      tensors.size(),
+      " tensors");
   ReduceOptions bopts;
   if (opts.timeout != kUnsetTimeout) {
     bopts.timeout = opts.timeout;
+  } else {
+    bopts.timeout = options_->timeout;
   }
-  return c10::make_intrusive<WorkWrapper>(backend_->reduce(
-      tensors.at(0),
-      static_cast<int>(opts.rootRank),
-      toReduceOp(opts.reduceOp),
-      opts.asyncOp,
-      bopts));
+  return c10::make_intrusive<WorkWrapper>(
+      backend_->reduce(
+          tensors.at(0),
+          static_cast<int>(opts.rootRank),
+          toReduceOp(opts.reduceOp),
+          opts.asyncOp,
+          bopts),
+      tensors);
 }
 
 c10::intrusive_ptr<c10d::Work> BackendWrapper::allgather(
     std::vector<std::vector<at::Tensor>>& outputTensors,
     std::vector<at::Tensor>& inputTensors,
     const c10d::AllgatherOptions& opts) {
-  TORCH_INTERNAL_ASSERT(
-      outputTensors.size() == 1, "Only single tensor supported");
-  TORCH_INTERNAL_ASSERT(
-      inputTensors.size() == 1, "Only single tensor supported");
+  TORCH_CHECK(
+      outputTensors.size() == 1,
+      "Only single output tensor list supported, but got ",
+      outputTensors.size());
+  TORCH_CHECK(
+      inputTensors.size() == 1,
+      "Only single input tensor supported, but got ",
+      inputTensors.size());
   AllGatherOptions bopts;
   if (opts.timeout != kUnsetTimeout) {
     bopts.timeout = opts.timeout;
+  } else {
+    bopts.timeout = options_->timeout;
   }
-  return c10::make_intrusive<WorkWrapper>(backend_->all_gather(
-      outputTensors.at(0), inputTensors.at(0), opts.asyncOp, bopts));
+  return c10::make_intrusive<WorkWrapper>(
+      backend_->all_gather(
+          outputTensors.at(0), inputTensors.at(0), opts.asyncOp, bopts),
+      outputTensors.at(0));
 }
 
 c10::intrusive_ptr<c10d::Work> BackendWrapper::allgather_coalesced(
     std::vector<std::vector<at::Tensor>>& outputTensorLists,
     std::vector<at::Tensor>& inputTensors,
     const c10d::AllgatherOptions& opts) {
-  TORCH_INTERNAL_ASSERT(
-      outputTensorLists.size() == 1, "Only single tensor supported");
-  TORCH_INTERNAL_ASSERT(
-      inputTensors.size() == 1, "Only single tensor supported");
+  TORCH_CHECK(
+      outputTensorLists.size() == 1,
+      "Only single output tensor list supported, but got ",
+      outputTensorLists.size());
+  TORCH_CHECK(
+      inputTensors.size() == 1,
+      "Only single input tensor supported, but got ",
+      inputTensors.size());
   AllGatherOptions bopts;
   if (opts.timeout != kUnsetTimeout) {
     bopts.timeout = opts.timeout;
+  } else {
+    bopts.timeout = options_->timeout;
   }
-  return c10::make_intrusive<WorkWrapper>(backend_->all_gather(
-      outputTensorLists.at(0), inputTensors.at(0), opts.asyncOp, bopts));
+  return c10::make_intrusive<WorkWrapper>(
+      backend_->all_gather(
+          outputTensorLists.at(0), inputTensors.at(0), opts.asyncOp, bopts),
+      outputTensorLists.at(0));
 }
 
-// TODO: Need to implement the case when input/output tensors are larger than
-// one. since this a coalesced version. We only support one input/output tensor
-// for now.
+// Note: Coalesced operations with multiple input/output tensors are not yet
+// supported. Currently only single tensor is supported. When extending this,
+// iterate over all tensors and coalesce them into a single backend call.
 c10::intrusive_ptr<c10d::Work> BackendWrapper::allgather_into_tensor_coalesced(
     std::vector<at::Tensor>& output_tensors,
     std::vector<at::Tensor>& inputTensors,
     const c10d::AllgatherOptions& opts) {
-  TORCH_INTERNAL_ASSERT(
-      output_tensors.size() == 1, "Only single tensor supported");
-  TORCH_INTERNAL_ASSERT(
-      inputTensors.size() == 1, "Only single tensor supported");
+  TORCH_CHECK(
+      output_tensors.size() == 1,
+      "Only single output tensor supported, but got ",
+      output_tensors.size());
+  TORCH_CHECK(
+      inputTensors.size() == 1,
+      "Only single input tensor supported, but got ",
+      inputTensors.size());
   AllGatherSingleOptions bopts;
   if (opts.timeout != kUnsetTimeout) {
     bopts.timeout = opts.timeout;
+  } else {
+    bopts.timeout = options_->timeout;
   }
-  return c10::make_intrusive<WorkWrapper>(backend_->all_gather_single(
-      output_tensors.at(0), inputTensors.at(0), opts.asyncOp, bopts));
+  return c10::make_intrusive<WorkWrapper>(
+      backend_->all_gather_single(
+          output_tensors.at(0), inputTensors.at(0), opts.asyncOp, bopts),
+      output_tensors);
 }
 
 c10::intrusive_ptr<c10d::Work> BackendWrapper::_allgather_base(
@@ -195,95 +313,133 @@ c10::intrusive_ptr<c10d::Work> BackendWrapper::_allgather_base(
   AllGatherSingleOptions bopts;
   if (opts.timeout != kUnsetTimeout) {
     bopts.timeout = opts.timeout;
+  } else {
+    bopts.timeout = options_->timeout;
   }
-  return c10::make_intrusive<WorkWrapper>(backend_->all_gather_single(
-      outputTensor, inputTensor, opts.asyncOp, bopts));
+  return c10::make_intrusive<WorkWrapper>(
+      backend_->all_gather_single(
+          outputTensor, inputTensor, opts.asyncOp, bopts),
+      std::vector<at::Tensor>{outputTensor});
 }
 
 c10::intrusive_ptr<c10d::Work> BackendWrapper::gather(
     std::vector<std::vector<at::Tensor>>& outputTensors,
     std::vector<at::Tensor>& inputTensors,
     const c10d::GatherOptions& opts) {
-  TORCH_INTERNAL_ASSERT(
-      outputTensors.size() == 1, "Only single tensor supported");
-  TORCH_INTERNAL_ASSERT(
-      inputTensors.size() == 1, "Only single tensor supported");
+  TORCH_CHECK(
+      outputTensors.size() == 1,
+      "Only single output tensor list supported, but got ",
+      outputTensors.size());
+  TORCH_CHECK(
+      inputTensors.size() == 1,
+      "Only single input tensor supported, but got ",
+      inputTensors.size());
   GatherOptions bopts;
   if (opts.timeout != kUnsetTimeout) {
     bopts.timeout = opts.timeout;
+  } else {
+    bopts.timeout = options_->timeout;
   }
-  return c10::make_intrusive<WorkWrapper>(backend_->gather(
-      outputTensors.at(0),
-      inputTensors.at(0),
-      static_cast<int>(opts.rootRank),
-      opts.asyncOp));
+  return c10::make_intrusive<WorkWrapper>(
+      backend_->gather(
+          outputTensors.at(0),
+          inputTensors.at(0),
+          static_cast<int>(opts.rootRank),
+          opts.asyncOp),
+      outputTensors.at(0));
 }
 
 c10::intrusive_ptr<c10d::Work> BackendWrapper::scatter(
     std::vector<at::Tensor>& outputTensors,
     std::vector<std::vector<at::Tensor>>& inputTensors,
     const c10d::ScatterOptions& opts) {
-  TORCH_INTERNAL_ASSERT(
-      outputTensors.size() == 1, "Only single tensor supported");
+  TORCH_CHECK(
+      outputTensors.size() == 1,
+      "Only single output tensor supported, but got ",
+      outputTensors.size());
   ScatterOptions bopts;
-  bopts.timeout = opts.timeout;
+  if (opts.timeout != kUnsetTimeout) {
+    bopts.timeout = opts.timeout;
+  } else {
+    bopts.timeout = options_->timeout;
+  }
   if (getRank() == opts.rootRank) {
-    TORCH_INTERNAL_ASSERT(
-        inputTensors.size() == 1, "Only single tensor supported");
+    TORCH_CHECK(
+        inputTensors.size() == 1,
+        "Only single input tensor list supported on root rank, but got ",
+        inputTensors.size());
   } else {
     // if not in the root rank, initialize inputTensors as empty place holder
     // with an empty list
     inputTensors = {};
     inputTensors.emplace_back();
   }
-  return c10::make_intrusive<WorkWrapper>(backend_->scatter(
-      outputTensors.at(0),
-      inputTensors.at(0),
-      static_cast<int>(opts.rootRank),
-      opts.asyncOp));
+  return c10::make_intrusive<WorkWrapper>(
+      backend_->scatter(
+          outputTensors.at(0),
+          inputTensors.at(0),
+          static_cast<int>(opts.rootRank),
+          opts.asyncOp),
+      outputTensors);
 }
 
 c10::intrusive_ptr<c10d::Work> BackendWrapper::reduce_scatter(
     std::vector<at::Tensor>& outputTensors,
     std::vector<std::vector<at::Tensor>>& inputTensors,
     const c10d::ReduceScatterOptions& opts) {
-  TORCH_INTERNAL_ASSERT(
-      outputTensors.size() == 1, "Only single tensor supported");
-  TORCH_INTERNAL_ASSERT(
-      inputTensors.size() == 1, "Only single tensor supported");
+  TORCH_CHECK(
+      outputTensors.size() == 1,
+      "Only single output tensor supported, but got ",
+      outputTensors.size());
+  TORCH_CHECK(
+      inputTensors.size() == 1,
+      "Only single input tensor list supported, but got ",
+      inputTensors.size());
   ReduceScatterOptions bopts;
   if (opts.timeout != kUnsetTimeout) {
     bopts.timeout = opts.timeout;
+  } else {
+    bopts.timeout = options_->timeout;
   }
-  return c10::make_intrusive<WorkWrapper>(backend_->reduce_scatter(
-      outputTensors.at(0),
-      inputTensors.at(0),
-      toReduceOp(opts.reduceOp),
-      opts.asyncOp,
-      bopts));
+  return c10::make_intrusive<WorkWrapper>(
+      backend_->reduce_scatter(
+          outputTensors.at(0),
+          inputTensors.at(0),
+          toReduceOp(opts.reduceOp),
+          opts.asyncOp,
+          bopts),
+      outputTensors);
 }
 
-// TODO: Need to implement the case when input/output tensors are larger than
-// one. since this a coalesced version. We only support one input/output tensor
-// for now.
+// Note: Coalesced operations with multiple input/output tensors are not yet
+// supported. Currently only single tensor is supported. When extending this,
+// iterate over all tensors and coalesce them into a single backend call.
 c10::intrusive_ptr<c10d::Work> BackendWrapper::reduce_scatter_tensor_coalesced(
     std::vector<at::Tensor>& outputTensors,
     std::vector<at::Tensor>& inputTensors,
     const c10d::ReduceScatterOptions& opts) {
-  TORCH_INTERNAL_ASSERT(
-      outputTensors.size() == 1, "Only single tensor supported");
-  TORCH_INTERNAL_ASSERT(
-      inputTensors.size() == 1, "Only single tensor supported");
+  TORCH_CHECK(
+      outputTensors.size() == 1,
+      "Only single output tensor supported, but got ",
+      outputTensors.size());
+  TORCH_CHECK(
+      inputTensors.size() == 1,
+      "Only single input tensor supported, but got ",
+      inputTensors.size());
   ReduceScatterSingleOptions bopts;
   if (opts.timeout != kUnsetTimeout) {
     bopts.timeout = opts.timeout;
+  } else {
+    bopts.timeout = options_->timeout;
   }
-  return c10::make_intrusive<WorkWrapper>(backend_->reduce_scatter_single(
-      outputTensors.at(0),
-      inputTensors.at(0),
-      toReduceOp(opts.reduceOp),
-      opts.asyncOp,
-      bopts));
+  return c10::make_intrusive<WorkWrapper>(
+      backend_->reduce_scatter_single(
+          outputTensors.at(0),
+          inputTensors.at(0),
+          toReduceOp(opts.reduceOp),
+          opts.asyncOp,
+          bopts),
+      outputTensors);
 }
 
 c10::intrusive_ptr<c10d::Work> BackendWrapper::_reduce_scatter_base(
@@ -293,13 +449,17 @@ c10::intrusive_ptr<c10d::Work> BackendWrapper::_reduce_scatter_base(
   ReduceScatterSingleOptions bopts;
   if (opts.timeout != kUnsetTimeout) {
     bopts.timeout = opts.timeout;
+  } else {
+    bopts.timeout = options_->timeout;
   }
-  return c10::make_intrusive<WorkWrapper>(backend_->reduce_scatter_single(
-      outputTensor,
-      inputTensor,
-      toReduceOp(opts.reduceOp),
-      opts.asyncOp,
-      bopts));
+  return c10::make_intrusive<WorkWrapper>(
+      backend_->reduce_scatter_single(
+          outputTensor,
+          inputTensor,
+          toReduceOp(opts.reduceOp),
+          opts.asyncOp,
+          bopts),
+      std::vector<at::Tensor>{outputTensor});
 }
 
 c10::intrusive_ptr<c10d::Work> BackendWrapper::alltoall_base(
@@ -311,30 +471,41 @@ c10::intrusive_ptr<c10d::Work> BackendWrapper::alltoall_base(
   AllToAllvSingleOptions bopts;
   if (opts.timeout != kUnsetTimeout) {
     bopts.timeout = opts.timeout;
+  } else {
+    bopts.timeout = options_->timeout;
   }
-  return c10::make_intrusive<WorkWrapper>(backend_->all_to_all_v_single(
-      outputTensor,
-      inputTensor,
-      toVecUint64(outputSplitSizes),
-      toVecUint64(inputSplitSizes),
-      opts.asyncOp,
-      bopts));
+  return c10::make_intrusive<WorkWrapper>(
+      backend_->all_to_all_v_single(
+          outputTensor,
+          inputTensor,
+          toVecUint64(outputSplitSizes),
+          toVecUint64(inputSplitSizes),
+          opts.asyncOp,
+          bopts),
+      std::vector<at::Tensor>{outputTensor});
 }
 
 c10::intrusive_ptr<c10d::Work> BackendWrapper::alltoall(
     std::vector<at::Tensor>& outputTensors,
     std::vector<at::Tensor>& inputTensors,
     const c10d::AllToAllOptions& opts) {
-  TORCH_INTERNAL_ASSERT(
-      outputTensors.size() == 1, "Only single tensor supported");
-  TORCH_INTERNAL_ASSERT(
-      inputTensors.size() == 1, "Only single tensor supported");
+  TORCH_CHECK(
+      outputTensors.size() == 1,
+      "Only single output tensor supported, but got ",
+      outputTensors.size());
+  TORCH_CHECK(
+      inputTensors.size() == 1,
+      "Only single input tensor supported, but got ",
+      inputTensors.size());
   AllToAllOptions bopts;
   if (opts.timeout != kUnsetTimeout) {
     bopts.timeout = opts.timeout;
+  } else {
+    bopts.timeout = options_->timeout;
   }
   return c10::make_intrusive<WorkWrapper>(
-      backend_->all_to_all(outputTensors, inputTensors, opts.asyncOp, bopts));
+      backend_->all_to_all(outputTensors, inputTensors, opts.asyncOp, bopts),
+      outputTensors);
 }
 
 c10::intrusive_ptr<c10d::Work> BackendWrapper::barrier(
@@ -342,6 +513,8 @@ c10::intrusive_ptr<c10d::Work> BackendWrapper::barrier(
   BarrierOptions bopts;
   if (opts.timeout != kUnsetTimeout) {
     bopts.timeout = opts.timeout;
+  } else {
+    bopts.timeout = options_->timeout;
   }
   return c10::make_intrusive<WorkWrapper>(
       backend_->barrier(opts.asyncOp, bopts));
@@ -349,16 +522,24 @@ c10::intrusive_ptr<c10d::Work> BackendWrapper::barrier(
 
 c10::intrusive_ptr<c10d::Work>
 BackendWrapper::send(std::vector<at::Tensor>& tensors, int dstRank, int tag) {
-  TORCH_INTERNAL_ASSERT(tensors.size() == 1, "Only single tensor supported");
+  TORCH_CHECK(
+      tensors.size() == 1,
+      "Only single tensor supported, but got ",
+      tensors.size(),
+      " tensors");
   return c10::make_intrusive<WorkWrapper>(
-      backend_->send(tensors.at(0), dstRank, tag));
+      backend_->send(tensors.at(0), dstRank, tag), tensors);
 }
 
 c10::intrusive_ptr<c10d::Work>
 BackendWrapper::recv(std::vector<at::Tensor>& tensors, int srcRank, int tag) {
-  TORCH_INTERNAL_ASSERT(tensors.size() == 1, "Only single tensor supported");
+  TORCH_CHECK(
+      tensors.size() == 1,
+      "Only single tensor supported, but got ",
+      tensors.size(),
+      " tensors");
   return c10::make_intrusive<WorkWrapper>(
-      backend_->recv(tensors.at(0), srcRank, tag));
+      backend_->recv(tensors.at(0), srcRank, tag), tensors);
 }
 
 std::shared_ptr<TorchComm> BackendWrapper::getComm() const {
@@ -373,6 +554,22 @@ c10::intrusive_ptr<c10d::Backend::Options> BackendWrapper::getBackendOptions() {
   return c10::static_intrusive_pointer_cast<c10d::Backend::Options>(options_);
 }
 
+bool BackendWrapper::verifyWorkTimeoutForTest(
+    const c10::intrusive_ptr<c10d::Work>& work,
+    const std::chrono::milliseconds& timeout) {
+  // The work must be a WorkWrapper that wraps a TorchWork
+  auto workWrapper = c10::dynamic_intrusive_pointer_cast<WorkWrapper>(work);
+  if (!workWrapper) {
+    TORCH_CHECK(false, "Work is not a WorkWrapper");
+  }
+
+  // Get the timeout from the underlying TorchWork
+  return workWrapper->work_->getTimeout() == timeout;
+}
+
+void BackendWrapper::setTimeout(std::chrono::milliseconds timeout) {
+  options_->timeout = timeout;
+}
 c10::intrusive_ptr<c10d::Backend> BackendWrapper::split(
     const c10::intrusive_ptr<c10d::Store>& /* store */,
     const std::vector<int>& ranks,
@@ -395,5 +592,4 @@ c10::intrusive_ptr<c10d::Backend> BackendWrapper::split(
   return c10::make_intrusive<BackendWrapper>(new_comm);
 }
 
-} // namespace comms
-} // namespace torch
+} // namespace torch::comms

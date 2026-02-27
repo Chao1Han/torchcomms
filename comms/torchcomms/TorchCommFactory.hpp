@@ -14,8 +14,7 @@
 #include <comms/torchcomms/TorchCommBackend.hpp>
 #include <comms/torchcomms/TorchCommOptions.hpp>
 
-namespace torch {
-namespace comms {
+namespace torch::comms {
 
 class TorchCommFactory {
  public:
@@ -42,7 +41,6 @@ class TorchCommFactory {
   std::shared_ptr<TorchCommBackend> create_generic_backend(
       const std::string& backend);
 
- private:
   std::mutex mutex_;
   std::unordered_map<
       std::string,
@@ -53,5 +51,4 @@ class TorchCommFactory {
       std::function<std::shared_ptr<c10::Allocator>()>>
       allocator_factories_;
 };
-} // namespace comms
-} // namespace torch
+} // namespace torch::comms

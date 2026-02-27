@@ -1,7 +1,9 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates.
 
 #pragma once
-
+#include <ATen/ATen.h>
+#include <cuda_runtime.h> // @manual=third-party//cuda:cuda-lazy
+#include <torch/csrc/distributed/c10d/Store.hpp> // @manual=//caffe2:torch-cpp
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -13,42 +15,31 @@
 #include <unordered_map>
 #include <vector>
 
-#include <ATen/ATen.h>
-#include <cuda_runtime.h> // @manual=third-party//cuda:cuda-lazy
-#include <torch/csrc/distributed/c10d/Store.hpp> // @manual=//caffe2:torch-cpp
-
 #include "comms/torchcomms/TorchComm.hpp"
 #include "comms/torchcomms/TorchCommBackend.hpp"
 #include "comms/torchcomms/TorchCommBatch.hpp"
-#include "comms/torchcomms/device/CudaApi.hpp"
+#include "comms/torchcomms/device/cuda/CudaApi.hpp"
+#include "comms/torchcomms/ncclx/GraphEventTracker.hpp"
 #include "comms/torchcomms/ncclx/NcclxApi.hpp"
 #include "comms/torchcomms/ncclx/TorchCommNCCLXPersistentRequest.hpp"
 #include "comms/torchcomms/ncclx/TorchCommWindowNCCLX.hpp"
 #include "comms/torchcomms/ncclx/TorchWorkNCCLX.hpp"
 
-namespace torch {
-namespace comms {
+namespace torch::comms {
 
+// Maximum number of CUDA events to keep in the event pool. Events are recycled
+// to avoid repeated cudaEventCreate/cudaEventDestroy calls. 1000 events should
+// be sufficient for most workloads while keeping memory overhead reasonable.
 constexpr size_t kDefaultMaxEventPoolSize = 1000;
+
+// Interval in milliseconds between garbage collection cycles for completed
+// work items. 100ms provides a good balance between timely cleanup and CPU
+// overhead from frequent GC runs.
 constexpr size_t kDefaultGarbageCollectIntervalMs = 100;
+
+// Whether to enable CUDA graph support by default. When enabled, monitoring
+// events are tracked during graph capture for timeout detection during replay.
 constexpr bool kDefaultEnableCudaGraphSupport = true;
-
-// Custom exception class for better error handling
-class NCCLException : public std::exception {
- public:
-  NCCLException(
-      NcclxApi& api,
-      const std::string& message,
-      ncclResult_t result,
-      ncclComm_t comm);
-
-  const char* what() const noexcept override;
-  ncclResult_t getResult() const;
-
- private:
-  std::string message_;
-  ncclResult_t result_;
-};
 
 class TorchCommNCCLX : public TorchCommBackend,
                        public std::enable_shared_from_this<TorchCommNCCLX> {
@@ -221,8 +212,9 @@ class TorchCommNCCLX : public TorchCommBackend,
       bool async_op,
       const GatherOptions& options = {}) override;
 
-  // Window & One-sidede Operations
-  std::shared_ptr<TorchCommWindow> new_window() override;
+  // Window & One-sided Operations
+  std::shared_ptr<TorchCommWindow> new_window(
+      const std::optional<at::Tensor>& tensor = std::nullopt) override;
 
   // Communicator Management
   std::shared_ptr<TorchCommBackend> split(
@@ -232,7 +224,9 @@ class TorchCommNCCLX : public TorchCommBackend,
 
   // Friend access for TorchCommNCCLX
   friend class TorchWorkNCCLX;
+  friend class GraphEventTracker;
   friend class CachingAllocatorHookImpl;
+  template <typename B>
   friend class TorchCommWindowNCCLX;
   friend class TorchCommNCCLXPersistentRequest;
 
@@ -266,7 +260,7 @@ class TorchCommNCCLX : public TorchCommBackend,
 
  protected:
   // Event management for friend classes
-  cudaEvent_t getEvent();
+  [[nodiscard]] cudaEvent_t getEvent();
   void returnEvent(cudaEvent_t event);
   void abortNcclComm();
 
@@ -315,6 +309,8 @@ class TorchCommNCCLX : public TorchCommBackend,
     return internal_stream_;
   }
 
+  void checkGraphEvents();
+
  private:
   // Helper that automatically cleans up premul sums.
   struct RedOpRAII {
@@ -330,8 +326,31 @@ class TorchCommNCCLX : public TorchCommBackend,
     RedOpRAII() = delete;
     RedOpRAII(const RedOpRAII&) = delete;
     RedOpRAII& operator=(const RedOpRAII&) = delete;
-    RedOpRAII(RedOpRAII&& tmp) = delete;
-    RedOpRAII& operator=(RedOpRAII&&) = delete;
+
+    RedOpRAII(RedOpRAII&& other) noexcept
+        : ncclRedOp_(other.ncclRedOp_),
+          comm_(other.comm_),
+          nccl_api_(std::move(other.nccl_api_)) {
+      other.comm_ = nullptr; // Prevent destructor from destroying the op
+    }
+
+    RedOpRAII& operator=(RedOpRAII&& other) noexcept {
+      if (this != &other) {
+        // Destroy current op if we own one
+        if (comm_ && nccl_api_) {
+          NCCLX_CHECK_IGNORE(
+              nccl_api_,
+              nccl_api_->redOpDestroy(ncclRedOp_, comm_),
+              "failed to destroy NCCL reduction operation");
+        }
+        ncclRedOp_ = other.ncclRedOp_;
+        comm_ = other.comm_;
+        nccl_api_ = std::move(other.nccl_api_);
+        other.comm_ = nullptr; // Prevent destructor from destroying the op
+      }
+      return *this;
+    }
+
     ~RedOpRAII();
 
     operator ncclRedOp_t() const {
@@ -356,7 +375,14 @@ class TorchCommNCCLX : public TorchCommBackend,
 
     RegistrationHandle(const RegistrationHandle&) = delete;
     RegistrationHandle& operator=(const RegistrationHandle&) = delete;
-    RegistrationHandle& operator=(RegistrationHandle&&) = delete;
+
+    RegistrationHandle& operator=(RegistrationHandle&& other) noexcept {
+      if (this != &other) {
+        regHandle = other.regHandle;
+        other.regHandle = nullptr;
+      }
+      return *this;
+    }
 
     ~RegistrationHandle() = default;
   };
@@ -428,29 +454,11 @@ class TorchCommNCCLX : public TorchCommBackend,
   bool high_priority_stream_{false};
   std::string name_;
 
-  // Graph capture mode work references
-  // Keep references to work objects during graph capture to prevent premature
-  // destruction, organized per graph using capture ID
-  std::unordered_map<
-      unsigned long long,
-      std::vector<c10::intrusive_ptr<TorchWorkNCCLX>>>
-      graph_capture_work_refs_;
-  std::mutex graph_capture_work_mutex_;
-
-  // Structure to hold cleanup data for CUDA user objects
-  struct GraphCleanupData {
-    TorchCommNCCLX* comm;
-    unsigned long long graph_id;
-
-    GraphCleanupData(TorchCommNCCLX* comm_, unsigned long long id)
-        : comm(comm_), graph_id(id) {}
-  };
-
-  // Static callback function for CUDA user object cleanup
-  static void CUDART_CB graphCleanupCallback(void* userData);
+  // Tracks ad-hoc events for CUDA graph-captured collectives and monitors
+  // them for timeout during graph replay.
+  GraphEventTracker graph_event_tracker_;
 
   friend class TorchWorkNCCLXQueueCommTest;
 };
 
-} // namespace comms
-} // namespace torch
+} // namespace torch::comms

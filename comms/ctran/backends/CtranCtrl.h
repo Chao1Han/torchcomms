@@ -12,6 +12,7 @@
 #include <unordered_map>
 
 #include "comms/ctran/backends/CtranAux.h"
+#include "comms/ctran/regcache/IpcRegCacheBase.h"
 #include "comms/ctran/utils/CtranIpc.h"
 
 constexpr int CTRAN_MAX_IB_DEVICES_PER_RANK{2};
@@ -93,43 +94,14 @@ struct CmsgIbExportMem {
   }
 };
 
-struct CmsgNvlExportMem {
-  ctran::utils::CtranIpcDesc ipcDesc;
-  // offset since the base of ipcDesc
-  size_t offset{0};
-
-  static const std::string name;
-
-  CmsgNvlExportMem() {};
-  std::string toString() const {
-    std::stringstream ss;
-    ss << "[" << name << "] offset: 0x" << std::hex << offset << " "
-       << ipcDesc.toString();
-    return ss.str();
-  }
-};
-
-struct CmsgNvlReleaseMem {
-  void* base{nullptr};
-
-  static const std::string name;
-
-  CmsgNvlReleaseMem() {};
-  std::string toString() const {
-    std::stringstream ss;
-    ss << "[" << name << "] base: " << base;
-    return ss.str();
-  }
-};
-
 /**
  * Packet structure of control message transferred by underlying backend.
  */
 struct ControlMsg {
   int type{ControlMsgType::UNSPECIFIED};
   union {
-    struct CmsgNvlExportMem nvlExp;
-    struct CmsgNvlReleaseMem nvlRls;
+    struct ctran::regcache::IpcDesc ipcDesc;
+    struct ctran::regcache::IpcRelease ipcRls;
     struct CmsgIbExportMem ibExp;
   };
 
@@ -146,10 +118,10 @@ struct ControlMsg {
     // Initialization
     switch (type) {
       case ControlMsgType::NVL_EXPORT_MEM:
-        nvlExp = CmsgNvlExportMem{};
+        ipcDesc = ctran::regcache::IpcDesc{};
         break;
       case ControlMsgType::NVL_RELEASE_MEM:
-        nvlRls = CmsgNvlReleaseMem{};
+        ipcRls = ctran::regcache::IpcRelease{};
         break;
       case ControlMsgType::IB_EXPORT_MEM:
         ibExp = CmsgIbExportMem{};
@@ -163,10 +135,10 @@ struct ControlMsg {
     std::stringstream ss;
     switch (type) {
       case ControlMsgType::NVL_EXPORT_MEM:
-        ss << nvlExp.toString();
+        ss << ipcDesc.toString();
         break;
       case ControlMsgType::NVL_RELEASE_MEM:
-        ss << nvlRls.toString();
+        ss << ipcRls.toString();
         break;
       case ControlMsgType::IB_EXPORT_MEM:
         ss << ibExp.toString();

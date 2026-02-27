@@ -8,8 +8,7 @@
 #include "comms/torchcomms/TorchCommLogging.hpp"
 #include "nccl.h" // @manual
 
-namespace torch {
-namespace comms {
+namespace torch::comms {
 
 namespace {
 
@@ -53,7 +52,11 @@ void createPreMulSum(
       is_tensor ? dataType == getNcclDataTypeInternal(tensor)
                 : dataType != ncclBfloat16,
       "PreMulSum factor type must match input data type");
-  nccl_api->redOpCreatePreMulSum(op, scalar, dataType, residence, comm);
+  NCCL_CHECK(
+      nccl_api,
+      comm,
+      nccl_api->redOpCreatePreMulSum(op, scalar, dataType, residence, comm),
+      "NCCL redOpCreatePreMulSum failed");
 }
 
 } // namespace
@@ -103,7 +106,10 @@ TorchCommNCCL::RedOpRAII::RedOpRAII(
 
 TorchCommNCCL::RedOpRAII::~RedOpRAII() {
   if (comm_) {
-    nccl_api_->redOpDestroy(ncclRedOp_, comm_);
+    NCCL_CHECK_IGNORE(
+        nccl_api_,
+        nccl_api_->redOpDestroy(ncclRedOp_, comm_),
+        "NCCL redOpDestroy failed");
   }
 }
 
@@ -194,10 +200,10 @@ void TorchCommNCCL::checkWorkQueue() {
 // The timeout thread cannot make NCCL calls.  The only CUDA call it can make
 // it cudaEventQuery.
 void TorchCommNCCL::timeoutWatchdog() noexcept {
-  TC_LOG(INFO) << "Timeout thread starting for rank: " << rank_;
+  TC_LOG(INFO, this) << "Timeout thread starting for rank: " << rank_;
 
   cudaStreamCaptureMode mode = cudaStreamCaptureModeThreadLocal;
-  CUDA_CHECK(
+  CUDA_CHECK_IGNORE(
       cuda_api_,
       cuda_api_->threadExchangeStreamCaptureMode(&mode),
       "Failed to swap capture mode for timeout thread");
@@ -217,24 +223,54 @@ void TorchCommNCCL::timeoutWatchdog() noexcept {
     }
 
     // Check work objects for completion or timeout
+    // Thread-safety: checkWorkQueue() calls garbageCollect() which acquires
+    // work_queues_mutex_ before accessing the work queue, ensuring safe
+    // concurrent access with the main thread's enqueueWork() calls.
+    //
+    // NOTE: garbageCollect may pop a completed work item whose destruction
+    // releases the last shared_ptr to this comm, triggering our destructor.
+    // In that case, the destructor sets shutdown_=true and detaches this
+    // thread. We must check shutdown_ immediately after to avoid accessing
+    // potentially destroyed member state.
     checkWorkQueue();
+    if (shutdown_) {
+      break;
+    }
     if (comm_state_ != CommState::NORMAL &&
         options_.abort_process_on_timeout_or_error) {
       // Log the error and abort the process.  We cannot abort the NCCL
       // communicator as it is not safe to call NCCL operations from
       // multiple threads at the same time.
       if (comm_state_ == CommState::TIMEOUT) {
-        TC_LOG(ERROR) << "Aborting process due to timeout on rank " << rank_
-                      << " - timeout watchdog detected operation timeout";
+        TC_LOG(ERROR, this)
+            << "Aborting process due to timeout on rank " << rank_
+            << " - timeout watchdog detected operation timeout";
       } else if (comm_state_ == CommState::ERROR) {
-        TC_LOG(ERROR) << "Aborting process due to error on rank " << rank_
-                      << " - timeout watchdog detected operation error. ";
+        TC_LOG(ERROR, this) << "Aborting process due to error on rank " << rank_
+                            << " - timeout watchdog detected operation error. ";
       }
       abort();
     }
+
+    // Check communicator for async error
+    if (comm_state_ == CommState::NORMAL) {
+      ncclResult_t asyncErr;
+      NCCL_CHECK(
+          nccl_api_,
+          nccl_comm_,
+          nccl_api_->commGetAsyncError(nccl_comm_, &asyncErr),
+          "failed to get async error");
+      if (asyncErr != ncclSuccess) {
+        comm_state_ = CommState::ERROR;
+        TC_LOG(ERROR, this)
+            << "Aborting process due to error on rank " << rank_
+            << " - nccl hit async error: " << ncclGetErrorString(asyncErr);
+        abort();
+      }
+    }
   }
 
-  TC_LOG(INFO) << "Timeout thread exiting for rank: " << rank_;
+  TC_LOG(INFO, this) << "Timeout thread exiting for rank: " << rank_;
 }
 
 void TorchCommNCCL::checkInitialized() const {
@@ -255,19 +291,24 @@ void TorchCommNCCL::checkAndAbortIfTimedOutOrError() {
   if (comm_state_ == CommState::TIMEOUT) {
     abortNcclComm();
     if (options_.abort_process_on_timeout_or_error) {
-      TC_LOG(ERROR) << "Aborting process due to timeout";
+      TC_LOG(ERROR, this) << "Aborting process due to timeout";
       abort();
     } else {
       throw std::runtime_error("NCCL operation timed out");
     }
   } else if (comm_state_ == CommState::ERROR) {
     ncclResult_t asyncErr;
-    nccl_api_->commGetAsyncError(nccl_comm_, &asyncErr);
-    NCCLException ncclException(*nccl_api_, "NCCL Async Error", asyncErr);
+    NCCL_CHECK(
+        nccl_api_,
+        nccl_comm_,
+        nccl_api_->commGetAsyncError(nccl_comm_, &asyncErr),
+        "failed to get async error");
+    NCCLException ncclException(
+        *nccl_api_, "NCCL Async Error", asyncErr, nccl_comm_);
     abortNcclComm();
     if (options_.abort_process_on_timeout_or_error) {
-      TC_LOG(ERROR) << "Aborting process due to error: "
-                    << ncclException.what();
+      TC_LOG(ERROR, this) << "Aborting process due to error: "
+                          << ncclException.what();
       abort();
     } else {
       throw ncclException;
@@ -297,7 +338,17 @@ c10::intrusive_ptr<TorchWorkNCCL> TorchCommNCCL::createWork(
     const std::vector<at::Tensor>& inputTensors) {
   // Only create the work object without enqueuing it
   auto work = c10::make_intrusive<TorchWorkNCCL>(
-      shared_from_this(), stream, timeout, inputTensors, tracing_);
+      shared_from_this(), stream, timeout, inputTensors);
+  return work;
+}
+
+c10::intrusive_ptr<TorchWorkNCCL> TorchCommNCCL::createWork(
+    cudaStream_t stream,
+    std::chrono::milliseconds timeout,
+    const at::Tensor& inputTensor) {
+  // Single-tensor overload to avoid vector allocation
+  auto work = c10::make_intrusive<TorchWorkNCCL>(
+      shared_from_this(), stream, timeout, inputTensor);
   return work;
 }
 
@@ -455,5 +506,4 @@ void TorchCommNCCL::detachMemoryHook() {
   CachingAllocatorHook::getInstance().deregisterComm(this);
 }
 
-} // namespace comms
-} // namespace torch
+} // namespace torch::comms

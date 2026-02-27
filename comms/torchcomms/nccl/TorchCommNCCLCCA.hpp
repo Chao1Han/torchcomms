@@ -8,8 +8,7 @@
 #include <mutex>
 #include "comms/torchcomms/nccl/TorchCommNCCL.hpp"
 
-namespace torch {
-namespace comms {
+namespace torch::comms {
 
 class CachingAllocatorHookImpl {
  public:
@@ -74,11 +73,12 @@ class CachingAllocatorHook {
   }
 
   inline static std::unique_ptr<CachingAllocatorHookImpl> instance_ = nullptr;
+  // NOLINTNEXTLINE(facebook-hte-std::once_flag)
+  inline static std::once_flag init_flag_;
 };
 
 // Global function to be registered as a hook
 void cachingAllocatorHookFn(
     const c10::cuda::CUDACachingAllocator::TraceEntry& te);
 
-} // namespace comms
-} // namespace torch
+} // namespace torch::comms

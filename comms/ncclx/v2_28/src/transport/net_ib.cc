@@ -28,6 +28,9 @@
 #include "ibvwrap.h"
 #include "mlx5/mlx5dvwrap.h"
 
+#include "comms/utils/cvars/nccl_cvars.h"
+#include "comms/utils/logger/ProcessGlobalErrorsUtil.h"
+
 #define MAXSUFFIXSIZE 16
 #define MAXNAMESIZE (64 + MAXSUFFIXSIZE)
 static char ncclIbIfName[MAX_IF_NAME_SIZE+1];
@@ -2540,10 +2543,28 @@ ncclResult_t ncclIbTest(void* request, int* done, int* sizes) {
               // For Send use the request size as WC byte_len is not reliable
               reqSize = req->send.size;
             }
-            WARN("NET/IB: Got completion from peer %s with status=%s(%d) opcode=%s(%d) reqSize=%d vendor_err=%u req_type=%s%s%s%s%s hca %s",
+            WARN_WITH_SCUBA("NET/IB: Got completion from peer %s with status=%s(%d) opcode=%s(%d) reqSize=%d vendor_err=%u req_type=%s%s%s%s%s hca %s",
                 ncclSocketToString(&addr, line), ibvWcStatusStr(wc->status), wc->status,
                 ibvWcOpcodeStr(wc->opcode), wc->opcode, reqSize, wc->vendor_err, reqTypeStr[r->type],
                 localGidStr ?  " localGid ":"", localGidString, remoteGidStr ? " remoteGids":"", remoteGidString, hcaName);
+            if (NCCL_PROCESS_GLOBAL_ERRORS_MAX_STACK_TRACES > 0) {
+              ProcessGlobalErrorsUtil::IbCompletionError ibErr{
+                  .peer = std::string(ncclSocketToString(&addr, line, 0)),
+                  .statusStr = std::string(ibvWcStatusStr(wc->status)),
+                  .status = wc->status,
+                  .opcodeStr = std::string(ibvWcOpcodeStr(wc->opcode)),
+                  .opcode = wc->opcode,
+                  .reqSize = reqSize,
+                  .vendorErr = wc->vendor_err,
+                  .reqType = std::string(reqTypeStr[r->type]),
+                  .localGid = localGidStr ? std::string(localGidString) : "",
+                  .remoteGid = remoteGidStr ? std::string(remoteGidString) : "",
+                  .hcaName = std::string(hcaName),
+                  .scaleupDomain = ProcessGlobalErrorsUtil::getScaleupDomain(),
+                  .localHostname = ProcessGlobalErrorsUtil::getHostname(),
+              };
+              ProcessGlobalErrorsUtil::addIbCompletionError(std::move(ibErr));
+            }
             return ncclRemoteError;
           }
 
@@ -2936,6 +2957,15 @@ ncclResult_t ncclGinIbGdakiDeregMrSym(void* collComm, void* mhandle) {
   return ncclGinGdakiDeregMrSym((struct ncclGinIbCollComm *)collComm, mhandle);
 }
 
+ncclResult_t ncclGinIbGdakiRegMrLocal(void* collComm, void* data, size_t size, int type,
+                                      uint64_t mr_flags, void** mhandle, void **ginHandle) {
+  return ncclGinGdakiRegMrLocal((struct ncclGinIbCollComm *)collComm, data, size, type, mhandle, ginHandle);
+}
+
+ncclResult_t ncclGinIbGdakiDeregMrLocal(void* collComm, void* mhandle) {
+  return ncclGinGdakiDeregMrLocal((struct ncclGinIbCollComm *)collComm, mhandle);
+}
+
 ncclResult_t ncclGinIbGdakiDestroyContext(void* ginCtx) {
   return ncclGinGdakiDestroyContext(ginCtx);
 }
@@ -2960,6 +2990,8 @@ ncclGin_t ncclGinIbGdaki = {
   ncclGinIbGdakiRegMrSym,
   NULL, // regMrSymDmaBuf
   ncclGinIbGdakiDeregMrSym,
+  ncclGinIbGdakiRegMrLocal,   // Local-only registration (non-collective)
+  ncclGinIbGdakiDeregMrLocal, // Local-only deregistration
   ncclGinIbGdakiDestroyContext,
   ncclGinIbCloseColl,
   ncclIbCloseListen,
@@ -3215,13 +3247,15 @@ ncclGin_t ncclGinIbProxy = {
   ncclGinIbProxyRegMrSym,
   ncclGinIbProxyRegMrSymDmaBuf,
   ncclGinIbProxyDeregMrSym,
-  NULL,
+  NULL, // regMrLocal - not supported in proxy mode
+  NULL, // deregMrLocal - not supported in proxy mode
+  NULL, // destroyContext
   ncclGinIbCloseColl,
   ncclIbCloseListen,
   ncclGinIbProxyIPut,
   ncclGinIbProxyIPutSignal,
   ncclGinIbProxyTest,
-  NULL,
-  NULL,
+  NULL, // ginProgress
+  NULL, // queryLastError
   ncclGinIbFinalize
 };

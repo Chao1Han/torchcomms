@@ -54,8 +54,8 @@ class DeviceMeshTest(unittest.TestCase):
         dist.all_reduce(t, group=group)
 
         # Device-aware synchronization
-        if device.type == "cuda":
-            torch.cuda.synchronize()
+        if device.type != "cpu":
+            torch.accelerator.synchronize()
         # No synchronization needed for CPU
 
         self.assertEqual(t[0].item(), comm.get_size())
@@ -63,23 +63,22 @@ class DeviceMeshTest(unittest.TestCase):
         comm.finalize()
 
     @unittest.skipIf(
-        torch.cuda.device_count() < 4, "Skipping non GPU situations for now"
+        torch.accelerator.device_count() < 4, "Skipping non GPU situations for now"
     )
     def test_2_d_parallel(self) -> None:
         backend = os.environ["TEST_BACKEND"]
         device = torch.device(os.environ.get("TEST_DEVICE", "cuda"))
-        world_size = torch.cuda.device_count()
-        dp_degree = 2
-        tp_degree = world_size // dp_degree
-        mesh = torch.arange(world_size, dtype=torch.int, device="cpu").view(
-            dp_degree, tp_degree
-        )
-
         comm = torchcomms.new_comm(
             backend,
             device,
             name="comms_test_2_d_parallel",
             timeout=datetime.timedelta(seconds=60),
+        )
+        world_size = comm.get_size()
+        dp_degree = 2
+        tp_degree = world_size // dp_degree
+        mesh = torch.arange(world_size, dtype=torch.int, device="cpu").view(
+            dp_degree, tp_degree
         )
 
         # Get current rank to determine which groups this rank belongs to
@@ -133,8 +132,8 @@ class DeviceMeshTest(unittest.TestCase):
             dist.all_reduce(t, group=sub_group)
 
             # Device-aware synchronization
-            if device.type == "cuda":
-                torch.cuda.synchronize()
+            if device.type != "cpu":
+                torch.accelerator.synchronize()
             # No synchronization needed for CPU
 
             self.assertEqual(t[0].item(), sub_comm.get_size())
@@ -152,8 +151,8 @@ class DeviceMeshTest(unittest.TestCase):
         dist.all_reduce(t, group=sub_group)
 
         # Device-aware synchronization
-        if device.type == "cuda":
-            torch.cuda.synchronize()
+        if device.type != "cpu":
+            torch.accelerator.synchronize()
         # No synchronization needed for CPU
 
         self.assertEqual(t[0].item(), sub_comm.get_size())
@@ -210,25 +209,25 @@ class DeviceMeshTest(unittest.TestCase):
         return flatten_ranks_per_dim
 
     @unittest.skipIf(
-        torch.cuda.device_count() < 8 or not HAS_MESH_LAYOUT,
+        torch.accelerator.device_count() < 8 or not HAS_MESH_LAYOUT,
         "Skipping non GPU situations for now",
     )
     def test_n_d_parallel(self) -> None:
         backend = os.environ["TEST_BACKEND"]
         device = torch.device(os.environ.get("TEST_DEVICE", "cuda"))
-        world_size = torch.cuda.device_count()
-        pp_degree = 2
-        ep_degree = 2
-        cp_degree = world_size // (pp_degree * ep_degree)
-        mesh = torch.arange(world_size, dtype=torch.int, device="cpu").view(
-            pp_degree, cp_degree, ep_degree
-        )
-
         comm = torchcomms.new_comm(
             backend,
             device,
             name="comms_test_n_d_parallel",
             timeout=datetime.timedelta(seconds=60),
+        )
+
+        world_size = comm.get_size()
+        pp_degree = 2
+        ep_degree = 2
+        cp_degree = world_size // (pp_degree * ep_degree)
+        mesh = torch.arange(world_size, dtype=torch.int, device="cpu").view(
+            pp_degree, cp_degree, ep_degree
         )
 
         # Get current rank to determine which groups this rank belongs to
@@ -294,7 +293,7 @@ class DeviceMeshTest(unittest.TestCase):
         comm.finalize()
 
     @unittest.skipIf(
-        torch.cuda.device_count() < 4,
+        torch.accelerator.device_count() < 4,
         "Skipping not enough GPUs situations for now",
     )
     def test_backend_wrapper_split_group(self) -> None:
@@ -356,8 +355,8 @@ class DeviceMeshTest(unittest.TestCase):
         direct_split_comm.all_reduce(duplicate_t, ReduceOp.SUM, False)
 
         # Device-aware synchronization
-        if device.type == "cuda":
-            torch.cuda.synchronize()
+        if device.type != "cpu":
+            torch.accelerator.synchronize()
 
         # Verify the all_reduce result
         torch.testing.assert_close(t, duplicate_t)

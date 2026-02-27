@@ -9,13 +9,15 @@
 #include <torch/csrc/distributed/c10d/Store.hpp> // @manual=//caffe2:torch-cpp
 
 #include "comms/torchcomms/TorchCommOptions.hpp"
-#include "comms/torchcomms/device/CudaApi.hpp"
+#include "comms/torchcomms/device/cuda/CudaApi.hpp"
 #include "comms/torchcomms/nccl/NcclApi.hpp"
 #include "nccl.h" // @manual
 
-namespace torch {
-namespace comms {
+namespace torch::comms {
 
+// Default port for TCPStore-based unique ID exchange. This port is chosen
+// to match PyTorch's default TCPStore port (29500) for compatibility.
+// Users can override this via environment variables or configuration.
 constexpr uint16_t kTCPStorePort = 29500;
 
 class TorchCommNCCLBootstrap {
@@ -26,7 +28,7 @@ class TorchCommNCCLBootstrap {
       std::shared_ptr<NcclApi> nccl_api,
       std::shared_ptr<CudaApi> cuda_api,
       std::chrono::milliseconds timeout);
-  ~TorchCommNCCLBootstrap();
+  ~TorchCommNCCLBootstrap() noexcept;
 
   // Delete copy and move operations
   TorchCommNCCLBootstrap(const TorchCommNCCLBootstrap&) = delete;
@@ -80,5 +82,4 @@ void populateNcclConfigFromHints(
     const CommOptions& options,
     const std::string& name);
 
-} // namespace comms
-} // namespace torch
+} // namespace torch::comms

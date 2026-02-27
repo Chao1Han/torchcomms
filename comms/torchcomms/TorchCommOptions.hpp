@@ -11,8 +11,7 @@
 #include <string>
 #include <unordered_map>
 
-namespace torch {
-namespace comms {
+namespace torch::comms {
 
 // Options classes for collective operations
 class SendOptions {
@@ -181,5 +180,20 @@ class WaitSignalOptions {
   WaitSignalOptions() : timeout(kNoTimeout) {}
 };
 
-} // namespace comms
-} // namespace torch
+class AllGatherPInitOptions {
+ public:
+  std::unordered_map<std::string, std::string> hints;
+  std::chrono::milliseconds timeout;
+
+  AllGatherPInitOptions() : timeout(kNoTimeout) {}
+};
+
+class AllGatherPExecOptions {
+ public:
+  std::unordered_map<std::string, std::string> hints;
+  std::chrono::milliseconds timeout;
+
+  AllGatherPExecOptions() : timeout(kNoTimeout) {}
+};
+
+} // namespace torch::comms

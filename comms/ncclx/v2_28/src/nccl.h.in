@@ -91,6 +91,12 @@ typedef enum { ncclSuccess                 =  0,
 /* Window Registration flags */
 #define NCCL_WIN_DEFAULT 0x00
 #define NCCL_WIN_COLL_SYMMETRIC 0x01
+// TODO: Revisit NCCL_WIN_DEVICE_API - this is a temporary fix to bypass CTRAN
+// and force the original NCCL path for device API (GIN support).
+#define NCCL_WIN_DEVICE_API 0x02
+// Local-only registration for source buffers. Skips rkey allGather.
+// The resulting window can only be used as a source for put operations.
+#define NCCL_WIN_LOCAL_ONLY 0x04
 
 #define NCCL_WIN_REQUIRED_ALIGNMENT 4096
 
@@ -327,13 +333,33 @@ ncclResult_t pncclCommCuDevice(const ncclComm_t comm, int* device);
 ncclResult_t  ncclCommUserRank(const ncclComm_t comm, int* rank);
 ncclResult_t pncclCommUserRank(const ncclComm_t comm, int* rank);
 
-/* Register CUDA buffer for zero-copy operation */
+/* [DEPRECATED] Handle-based registration for zero-copy operation.
+ * Prefer ncclGlobalRegisterWithPtr for new code - it supports both single and
+ * multi-segment buffers without requiring handle management. */
 ncclResult_t  ncclCommRegister(const ncclComm_t comm, void* buff, size_t size, void** handle);
 ncclResult_t pncclCommRegister(const ncclComm_t comm, void* buff, size_t size, void** handle);
 
-/* Deregister CUDA buffer */
+/* [DEPRECATED] Handle-based deregistration.
+ * Prefer ncclGlobalDeregisterWithPtr for new code. */
 ncclResult_t  ncclCommDeregister(const ncclComm_t comm, void* handle);
 ncclResult_t pncclCommDeregister(const ncclComm_t comm, void* handle);
+
+/* Pointer-based registration for all buffer types - no handle returned.
+ * Supports both single-segment and multi-segment (expandable) buffers.
+ * Use ncclGlobalDeregisterWithPtr(buf, len) to deregister.
+ * "Global" because registration is stored in a global RegCache, not per-comm.
+ * Does not require a communicator - uses global backends set by first comm.
+ * cudaDev is auto-detected from the buffer pointer. */
+ncclResult_t  ncclGlobalRegisterWithPtr(void* buff, size_t size);
+ncclResult_t pncclGlobalRegisterWithPtr(void* buff, size_t size);
+
+/* Pointer-based deregistration for all buffer types.
+ * Uses pinRange to discover all physical segments and frees each.
+ * "Global" because registration is stored in a global RegCache, not per-comm.
+ * Does not require a communicator - uses global backends set by first comm.
+ * cudaDev is auto-detected from the buffer pointer. */
+ncclResult_t  ncclGlobalDeregisterWithPtr(void* buff, size_t size);
+ncclResult_t pncclGlobalDeregisterWithPtr(void* buff, size_t size);
 
 /* Register memory window  */
 ncclResult_t  ncclCommWindowRegister(ncclComm_t comm, void* buff, size_t size, ncclWindow_t* win, int winFlags);
@@ -882,6 +908,24 @@ ncclResult_t ncclCommDumpAll(std::unordered_map<std::string, std::unordered_map<
 
 #define NCCL_HAS_COMMS_TRACING_SERVICE_PORT
 ncclResult_t ncclCommsTracingServicePort(int& port);
+
+// NCCL_HAS_DUMP_ALGO_STAT controls whether dumpAlgoStat() is available.
+// By default, it is defined. To disable it (e.g., for adapters which may have
+// different ncclComm layout), compile with -DNCCL_HAS_DUMP_ALGO_STAT=0.
+#if !defined(NCCL_HAS_DUMP_ALGO_STAT)
+#define NCCL_HAS_DUMP_ALGO_STAT
+#elif NCCL_HAS_DUMP_ALGO_STAT == 0
+#undef NCCL_HAS_DUMP_ALGO_STAT
+#endif
+namespace ncclx::colltrace {
+
+// Dump collective algorithm statistics for a communicator.
+// Output map format: collective name -> algorithm name -> call count.
+// Requires NCCL_COLLTRACE=algostat to be enabled.
+// Clears and populates the output map. Empty if algostat not enabled or comm is null.
+void dumpAlgoStat(ncclComm_t comm, std::unordered_map<std::string, std::unordered_map<std::string, int64_t>>& map);
+
+} // namespace ncclx::colltrace
 
 namespace ncclx {
 

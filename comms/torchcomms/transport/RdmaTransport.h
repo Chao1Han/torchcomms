@@ -2,8 +2,11 @@
 
 #pragma once
 
+#include <chrono>
 #include <deque>
 #include <memory>
+#include <optional>
+#include <stdexcept>
 #include <string>
 
 #include <folly/Synchronized.h>
@@ -26,21 +29,48 @@ namespace torch::comms {
  * The memory is directly registered to the IB-Device and not specific
  * to an instance of a transport. And user can use any sub-range of this
  * registered memory for I/O APIs on RdmaTransport.
- *
- * Gotcha - Minimum memory block to be registered must be > 4097 bytes.
  */
 class RdmaMemory : folly::MoveOnly {
  public:
+  /**
+   * Read-only view into a subset of registered RDMA memory.
+   *
+   * LIFETIME SAFETY WARNING:
+   * View holds a reference to the parent RdmaMemory object. The parent
+   * MUST remain valid (not destroyed or moved) for the entire lifetime
+   * of any View objects. Accessing a View after its parent has been
+   * destroyed results in undefined behavior.
+   *
+   * Safe usage patterns:
+   *   - Use View only within the scope where parent RdmaMemory is valid
+   *   - Do not store View objects beyond the parent's lifetime
+   *   - Do not return View from functions that return by value if the
+   *     parent is a local variable
+   *
+   * Example of UNSAFE code:
+   *   RdmaMemory::View getView() {
+   *     RdmaMemory mem(buf, len, dev);  // local variable
+   *     return mem.createView(0, len);  // DANGER: mem destroyed here!
+   *   }  // View now holds dangling reference
+   */
   class View {
    public:
     /*
      * Create a view of a subset of RdmaMemory with bounds checking.
      * Asserts that the view is within the bounds of the parent memory.
+     *
+     * @param parent The parent RdmaMemory - must outlive this View
+     * @param offset Byte offset from start of parent buffer
+     * @param length Length of the view in bytes
+     * @throws std::invalid_argument if offset + length exceeds parent bounds
      */
     View(const RdmaMemory& parent, size_t offset, size_t length)
         : parent_(parent), offset_(offset), length_(length) {
       CHECK_THROW(offset <= parent_.len_, std::invalid_argument);
-      CHECK_THROW(offset + length <= parent_.len_, std::invalid_argument);
+      // Check for overflow and bounds in a single safe comparison
+      CHECK_THROW(
+          length <= parent_.len_ && offset <= parent_.len_ - length,
+          std::invalid_argument);
     }
 
     /*
@@ -61,12 +91,26 @@ class RdmaMemory : folly::MoveOnly {
       return &parent_;
     }
 
+    /**
+     * Check if the parent memory is still valid (non-null buffer).
+     * Note: This is a best-effort check - if the parent has been destroyed,
+     * calling this method is already undefined behavior.
+     */
+    bool isParentValid() const {
+      return parent_.buf_ != nullptr && parent_.regHdl_ != nullptr;
+    }
+
    protected:
     const RdmaMemory& parent_;
     const size_t offset_;
     const size_t length_;
   };
 
+  /**
+   * Mutable view into a subset of registered RDMA memory.
+   *
+   * See View class for lifetime safety warnings - all the same caveats apply.
+   */
   class MutableView : public View {
    public:
     /*
@@ -87,7 +131,7 @@ class RdmaMemory : folly::MoveOnly {
   RdmaMemory(const void* buf, size_t len, int cudaDev);
   RdmaMemory(RdmaMemory&& other) noexcept;
   RdmaMemory& operator=(RdmaMemory&& other) = delete;
-  ~RdmaMemory();
+  ~RdmaMemory() noexcept;
 
   View createView() const {
     return View(*this, 0, len_);
@@ -97,7 +141,19 @@ class RdmaMemory : folly::MoveOnly {
     return View(*this, offset, length);
   }
 
+  /**
+   * Create a view from an arbitrary pointer within this registered memory.
+   *
+   * @param buf Pointer that must be within the bounds of this RdmaMemory
+   * @param length Length of the view in bytes
+   * @throws std::out_of_range if buf is not within this memory region
+   * @throws std::invalid_argument if the resulting view exceeds bounds
+   */
   View createView(const void* buf, size_t length) const {
+    if (!contains(buf, length)) {
+      throw std::out_of_range(
+          "Pointer is not within the bounds of this registered memory region");
+    }
     const size_t offset = (uintptr_t)buf - (uintptr_t)buf_;
     return View(*this, offset, length);
   }
@@ -110,7 +166,20 @@ class RdmaMemory : folly::MoveOnly {
     return MutableView(*this, offset, length);
   }
 
+  /**
+   * Create a mutable view from an arbitrary pointer within this registered
+   * memory.
+   *
+   * @param buf Pointer that must be within the bounds of this RdmaMemory
+   * @param length Length of the view in bytes
+   * @throws std::out_of_range if buf is not within this memory region
+   * @throws std::invalid_argument if the resulting view exceeds bounds
+   */
   MutableView createMutableView(const void* buf, size_t length) const {
+    if (!contains(buf, length)) {
+      throw std::out_of_range(
+          "Pointer is not within the bounds of this registered memory region");
+    }
     const size_t offset = (uintptr_t)buf - (uintptr_t)buf_;
     return MutableView(*this, offset, length);
   }
@@ -149,9 +218,11 @@ class RdmaMemory : folly::MoveOnly {
   bool contains(const void* buf, const size_t len) const;
 
  private:
+  // These members are logically const after construction, but need to be
+  // mutable for move semantics to properly invalidate moved-from objects.
   const void* buf_{nullptr};
-  const size_t len_{0};
-  const int cudaDev_{-1};
+  size_t len_{0};
+  int cudaDev_{-1};
 
   void* regHdl_{nullptr};
   std::string remoteKey_;
@@ -185,21 +256,42 @@ struct RdmaRemoteBuffer {
  *   4. Use APIs for memory registration and data transfer
  *
  * folly::EventBase is used to drive the underlying RDMA operations. User
- * should have a dedicated EventBase for for transport operations and can
+ * should have a dedicated EventBase for transport operations and can
  * be shared across all transport instances. When requests are pending, this
  * will likely keep EventBase thread pretty busy to minimize latency.
  *
  * Supported RDMA APIs
  * - `write` -> RDMA write to a remote memory
+ * - `read`  -> RDMA read from a remote memory
  * - `waitForWrite` -> Wait for a remote write operation
  *
  * Future APIs that can be supported as per use-case. Given this framework
  * adding new APIs should be relatively straightforward.
  * - Send - RDMA Send (needs matching Recv on other end)
- * - Recv - RDMA Receive (needs mactching Send on other end)
- * - Read - RDMA Read from a remote memory
+ * - Recv - RDMA Receive (needs matching Send on other end)
  * - waitForRead - Wait for a remote read operation
  * - <Atomic APIs>
+ *
+ * API return value contracts (commResult_t):
+ * All async APIs (write, read, waitForWrite) return a commResult_t via
+ * SemiFuture. Callers MUST use the timeout parameter to ensure bounded
+ * completion — without it, operations may wait indefinitely for IB
+ * completion.
+ *
+ *   commSuccess — normal completion:
+ *     write(), read(), waitForWrite(), connect()
+ *
+ *   commTimeout — operation exceeded its timeout duration:
+ *     write()
+ *
+ *   commInternalError — IB / transport-level failure:
+ *     write(), read(), waitForWrite()
+ *
+ *   commUserAbort — transport was destroyed while operations were pending:
+ *     write(), read(), waitForWrite()
+ *
+ *   Throws (no commResult_t) — unrecoverable setup error:
+ *     bind(), connect()
  */
 class __attribute__((visibility("default"))) RdmaTransport {
  public:
@@ -227,7 +319,7 @@ class __attribute__((visibility("default"))) RdmaTransport {
 
   /*
    * Bind the transport and retrieve the unique identifier that can be used to
-   * connect from the other end. Throws exception on error.
+   * connect from the other end. Throws on failure.
    */
   std::string bind();
 
@@ -247,11 +339,17 @@ class __attribute__((visibility("default"))) RdmaTransport {
    * [Remote Op] Transfer data from local buffer to remote buffer on the peer
    * rank via RDMA. The remote side can use the `checkNotify` API to wait for
    * the completion of the transfer for every iput call with notify=true.
+   *
+   * @param timeout Optional timeout duration for the write operation. When
+   *                specified, the operation will complete with commTimeout if
+   *                the RDMA write does not finish within this duration. If not
+   *                specified (nullopt), the write waits indefinitely.
    */
   folly::SemiFuture<commResult_t> write(
       RdmaMemory::View localBuffer,
       const RdmaRemoteBuffer& remoteBuffer,
-      bool notify);
+      bool notify,
+      std::optional<std::chrono::milliseconds> timeout = std::nullopt);
 
   /*
    * [Remote Op] Check the arrival of incoming put transfer from the remote
@@ -267,6 +365,46 @@ class __attribute__((visibility("default"))) RdmaTransport {
       RdmaMemory::MutableView& localBuffer,
       const RdmaRemoteBuffer& remoteBuffer);
 
+  /*
+   * Mock type for testing RDMA transport error scenarios
+   */
+  enum class MockType {
+    None, // No mock, normal operation
+    Timeout, // Works complete with timeout error after specified duration
+    Failure, // Works complete immediately with commInternalError
+  };
+
+  /*
+   * Context for mock behavior, set via setMockForTest().
+   */
+  struct MockContext {
+    MockType type{MockType::None};
+  };
+
+  /*
+   * Inject software mock for testing. Any write while mock is enabled
+   * will behave according to the mock configuration:
+   * - Timeout: works stay pending until timeout fires (requires a timeout
+   *            to be specified in the write() call) or transport is destroyed
+   * - Failure: works complete immediately with commInternalError
+   * - None: reset to disable mock
+   *
+   * The mock type is captured when operations are created, not when they
+   * complete. Changing the mock config after calling write does not affect
+   * already-created operations.
+   *
+   * The control is per RdmaTransport instance, and the state is shared with
+   * all threads accessing the instance.
+   */
+  void setMockForTest(MockContext config);
+
+  /*
+   * Deprecated: This function is a no-op. Pending work cleanup is handled
+   * by the destructor. No upper-layer code should call this function.
+   * TODO: Remove after upper layer removes calling abort().
+   */
+  void abort();
+
  private:
   /*
    * Drive the IB progress loop and drive completion of pending requests.
@@ -280,6 +418,8 @@ class __attribute__((visibility("default"))) RdmaTransport {
   struct Work;
   folly::Synchronized<std::deque<std::unique_ptr<Work>>> pendingWorks_;
   std::unique_ptr<folly::AsyncTimeout> progressTimeout_;
+  // Mock configuration for testing; updated by setMockForTest
+  folly::Synchronized<MockContext> mockContext_;
 };
 
 } // namespace torch::comms

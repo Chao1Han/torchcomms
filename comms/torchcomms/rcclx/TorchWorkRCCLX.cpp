@@ -2,10 +2,10 @@
 
 #include "comms/torchcomms/rcclx/TorchWorkRCCLX.hpp"
 #include <ATen/hip/HIPContext.h> // @manual
+#include "comms/torchcomms/TorchCommLogging.hpp"
 #include "comms/torchcomms/rcclx/TorchCommRCCLX.hpp"
 
-namespace torch {
-namespace comms {
+namespace torch::comms {
 
 TorchWorkRCCLX::TorchWorkRCCLX(
     std::shared_ptr<TorchCommRCCLX> comm,
@@ -20,22 +20,6 @@ TorchWorkRCCLX::TorchWorkRCCLX(
   end_event_ = comm_->getEvent();
 
   // Events will be recorded around the actual RCCLX operations
-}
-
-TorchWorkRCCLX::TorchWorkRCCLX(TorchWorkRCCLX&& other) noexcept
-    : inputTensors_(std::move(other.inputTensors_)),
-      comm_(std::move(other.comm_)),
-      start_event_(other.start_event_),
-      end_event_(other.end_event_),
-      stream_(other.stream_),
-      timeout_ms_(other.timeout_ms_),
-      start_completed_time_(std::move(other.start_completed_time_)) {
-  // Transfer ownership of resources and reset the source object
-  other.start_event_ = nullptr;
-  other.end_event_ = nullptr;
-  other.stream_ = nullptr;
-  other.timeout_ms_ = std::chrono::milliseconds(0);
-  other.start_completed_time_.reset();
 }
 
 TorchWorkRCCLX::TorchWorkRCCLX(
@@ -63,7 +47,7 @@ TorchWorkRCCLX::~TorchWorkRCCLX() {
   comm_->returnEvent(end_event_);
 }
 
-void TorchWorkRCCLX::recordFunctionStart(const std::string& coll_name) {
+void TorchWorkRCCLX::recordFunctionStart(std::string_view coll_name) {
   recordFunction_.emplace(at::RecordScope::USER_SCOPE);
   if (!recordFunction_->isActive()) {
     return;
@@ -88,7 +72,7 @@ void TorchWorkRCCLX::recordFunctionStart(const std::string& coll_name) {
   }
 }
 
-void TorchWorkRCCLX::recordStart(const std::string& coll_name) {
+void TorchWorkRCCLX::recordStart(std::string_view coll_name) {
   recordFunctionStart(coll_name);
   HIP_CHECK(
       comm_->getHipApi(),
@@ -137,6 +121,7 @@ TorchWorkRCCLX::WorkStatus TorchWorkRCCLX::checkStatus() {
 
     // Release the input tensors to keep the lifetime of the tensors short
     inputTensors_.clear();
+    inputTensor_.reset();
   } else if (end_status == hipErrorNotReady) {
     // End event has not completed yet, check for timeout
     auto current_time = std::chrono::steady_clock::now();
@@ -146,7 +131,8 @@ TorchWorkRCCLX::WorkStatus TorchWorkRCCLX::checkStatus() {
 
     // Check if the operation has timed out
     if (elapsed_milliseconds > timeout_ms_) {
-      // Operation has timed out
+      TC_LOG(ERROR, comm_.get()) << "Operation timed out after "
+                                 << elapsed_milliseconds.count() << " ms";
       setStatus(WorkStatus::TIMEDOUT);
     }
   } else {
@@ -172,8 +158,7 @@ void TorchWorkRCCLX::wait() {
 
   // Get the current stream using the device from the comm object
   hipStream_t current_stream =
-      comm_->getHipApi()->getCurrentHIPStreamMasqueradingAsCUDA(
-          comm_->device_.index());
+      comm_->getHipApi()->getCurrentCUDAStream(comm_->device_.index());
 
   // Add a dependency from the work's stream to the current stream
   // This makes the current stream wait for the end_event_ recorded on the
@@ -182,6 +167,11 @@ void TorchWorkRCCLX::wait() {
       comm_->getHipApi(),
       comm_->getHipApi()->streamWaitEvent(current_stream, end_event_, 0),
       "Failed to make stream wait for event");
+
+  // Release tensor references. The HIP caching allocator manages stream
+  // semantics and will not reclaim memory until the stream operations
+  // complete.
+  inputTensors_.clear();
+  inputTensor_.reset();
 }
-} // namespace comms
-} // namespace torch
+} // namespace torch::comms

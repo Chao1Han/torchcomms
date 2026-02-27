@@ -243,7 +243,8 @@ commResult_t CtranGpe::Impl::submit(
   // FIXME: the multi-stream order enforcement is not compatible with cuda graph
   // capture; disable it under cuda graph capture as a workaround. We'd need
   // proper fix to support the compatibility.
-  if (streamCaptureInfo.status != cudaStreamCaptureStatusActive) {
+  if (streamCaptureInfo.status != cudaStreamCaptureStatusActive &&
+      !kernelConfig.canConcurrent) {
     FB_COMMCHECK(preKernelLaunch(kernelConfig.stream));
   }
 
@@ -365,7 +366,8 @@ commResult_t CtranGpe::Impl::submit(
   // FIXME: the multi-stream order enforcement is not compatible with cuda graph
   // capture; disable it under cuda graph capture as a workaround. We'd need
   // proper fix to support the compatibility.
-  if (streamCaptureInfo.status != cudaStreamCaptureStatusActive) {
+  if (streamCaptureInfo.status != cudaStreamCaptureStatusActive &&
+      !kernelConfig.canConcurrent) {
     FB_COMMCHECK(postKernelLaunch(kernelConfig.stream));
   }
 
@@ -502,7 +504,7 @@ void CtranGpe::Impl::gpeThreadFn() {
         // is only used for tracing purposes. Before the flags are freed below
         // with reset, all block flags are checked.
         while (flag_d[0] != KERNEL_STARTED &&
-               flag_d[0] != KERNEL_STARTED_AND_EXIT && !comm->testAbort()) {
+               flag_d[0] != KERNEL_STARTED_AND_EXIT) {
           std::this_thread::yield();
         }
       }
@@ -569,26 +571,15 @@ void CtranGpe::Impl::gpeThreadFn() {
           // After all blocks exited, we can safely reset.
           kernelFlag->reset();
         } else {
+          // In case of aborted comm, wait for kernel to start
+          while (comm->testAbort() &&
+                 !kernelFlag->testFlagAllGroups(KERNEL_STARTED)) {
+            std::this_thread::yield();
+          }
           // Stop kernel and kernel will free up the flag after confirmed the
           // termination
           kernelFlag->setFlagPerGroup(
               comm->testAbort() ? KERNEL_HOST_ABORT : KERNEL_TERMINATE);
-
-          if (comm->abortEnabled()) {
-            // Wait for kernel to exit, only necessary for Abort enabled
-            // case
-            while (!kernelFlag->testFlagAllGroups(KERNEL_UNSET) &&
-                   !comm->testAbort()) {
-              std::this_thread::yield();
-            }
-            if (comm->testAbort()) {
-              for (int i = 0; i < kernelFlag->numGroups_; i++) {
-                if (kernelFlag->flag_[i] == KERNEL_TERMINATE) {
-                  kernelFlag->flag_[i] = KERNEL_HOST_ABORT;
-                }
-              }
-            }
-          }
         }
         // Teardown unpack queue if it was allocated for this operation (TcpDM
         // backend). Don't wait for kernel to finish, the pool manages

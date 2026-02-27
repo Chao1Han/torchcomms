@@ -9,9 +9,9 @@
 #include <vector>
 #include "comms/ctran/CtranComm.h"
 #include "comms/ctran/backends/ib/CtranIbBase.h"
-#include "comms/ctran/backends/ib/CtranIbQpUtils.h"
 #include "comms/ctran/backends/ib/CtranIbSingleton.h"
 #include "comms/ctran/backends/ib/IbvWrap.h"
+#include "comms/ctran/ibverbx/IbvQpUtils.h"
 #include "comms/ctran/mapper/CtranMapperTypes.h"
 #include "comms/ctran/utils/Checks.h"
 #include "comms/ctran/utils/CtranPerf.h"
@@ -28,6 +28,8 @@ typedef std::pair<int, int> QpUniqueId;
 // Fix-sized payload buffer for IB transport to prepare and register the
 // temporary buffers for control messages
 constexpr int MAX_PAYLOAD_SIZE{4096};
+constexpr int MAX_SEND_WR{256};
+constexpr int MAX_RECV_WR{128};
 struct CtrlPacket {
   int type{0}; // for callback check
   size_t size{0}; // size of actual data in payload
@@ -195,7 +197,7 @@ class CtranIbVirtualConn {
   ~CtranIbVirtualConn();
 
   // The data channel may be temporarily unavailable due to run out of local
-  // send queue WQE. VC has already interally scheduled an implicit signal to
+  // send queue WQE. VC has already internally scheduled an implicit signal to
   // flush out queued WQEs and is waiting for the CQE completion.
   // Caller needs to call this function before posting a put. If it returns
   // false, progress needs to be made to poll CQE completion.
@@ -410,14 +412,23 @@ class CtranIbVirtualConn {
   }
 
   inline uint32_t getControlQpNum() const {
+    FB_CHECKABORT(
+        ibvControlQp_.has_value() && ibvControlQp_->qp() != nullptr,
+        "Control QP not initialized. Ensure getLocalBusCard() is called before setupVc().");
     return ibvControlQp_->qp()->qp_num;
   }
 
   inline uint32_t getNotifyQpNum() const {
+    FB_CHECKABORT(
+        ibvNotifyQp_.has_value() && ibvNotifyQp_->qp() != nullptr,
+        "Notify QP not initialized. Ensure getLocalBusCard() is called before setupVc().");
     return ibvNotifyQp_->qp()->qp_num;
   }
 
   inline uint32_t getAtomicQpNum() const {
+    FB_CHECKABORT(
+        ibvAtomicQp_.has_value() && ibvAtomicQp_->qp() != nullptr,
+        "Atomic QP not initialized. Ensure getLocalBusCard() is called before setupVc().");
     return ibvAtomicQp_->qp()->qp_num;
   }
 
@@ -435,15 +446,30 @@ class CtranIbVirtualConn {
     return qpIdx / (maxNumQps_ / NCCL_CTRAN_IB_DEVICES_PER_RANK);
   }
 
+  // Check if QPs have been initialized (via getLocalBusCard())
+  inline bool areQpsInitialized() const {
+    return ibvControlQp_.has_value() && ibvNotifyQp_.has_value() &&
+        ibvAtomicQp_.has_value() && !ibvDataQps_.empty();
+  }
+
   inline bool isNotifyQp(QpUniqueId qpId) const {
+    FB_CHECKABORT(
+        ibvNotifyQp_.has_value(),
+        "Notify QP not initialized when checking isNotifyQp");
     return ibvNotifyQp_->qp()->qp_num == qpId.first && qpId.second == 0;
   }
 
   inline bool isControlQp(QpUniqueId qpId) const {
+    FB_CHECKABORT(
+        ibvControlQp_.has_value(),
+        "Control QP not initialized when checking isControlQp");
     return ibvControlQp_->qp()->qp_num == qpId.first && qpId.second == 0;
   }
 
   inline bool isAtomicQp(QpUniqueId qpId) const {
+    FB_CHECKABORT(
+        ibvAtomicQp_.has_value(),
+        "Atomic QP not initialized when checking isAtomicQp");
     return ibvAtomicQp_->qp()->qp_num == qpId.first && qpId.second == 0;
   }
 
@@ -1152,7 +1178,7 @@ class CtranIbVirtualConn {
   }
 
   inline commResult_t tryPostImmNotifyMsg() {
-    if (outstandingNotifies_.size() >= ::ctran::ib::MAX_SEND_WR ||
+    if (outstandingNotifies_.size() >= MAX_SEND_WR ||
         pendingNotifies_.size() == 0) {
       return commSuccess;
     }

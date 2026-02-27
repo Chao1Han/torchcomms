@@ -3,18 +3,25 @@
 #pragma once
 
 #include <ATen/hip/HIPContext.h> // @manual
+#ifdef HIPIFY_V2
+#include <c10/hip/HIPCachingAllocator.h> // @manual
+#else
 #include <ATen/hip/impl/HIPCachingAllocatorMasqueradingAsCUDA.h> // @manual
+#endif
 #include <memory>
 #include <mutex>
 #include "comms/torchcomms/rccl/TorchCommRCCL.hpp"
 
-namespace torch {
-namespace comms {
+namespace torch::comms {
+
+using c10::cuda::CUDACachingAllocator::attachAllocatorTraceTracker;
+using c10::cuda::CUDACachingAllocator::snapshot;
+using c10::cuda::CUDACachingAllocator::TraceEntry;
 
 class CachingAllocatorHookImpl {
  public:
   virtual ~CachingAllocatorHookImpl() = default;
-  virtual void regDeregMem(const c10::hip::HIPCachingAllocator::TraceEntry& te);
+  virtual void regDeregMem(const TraceEntry& te);
   virtual void registerComm(TorchCommRCCL* comm);
   virtual void deregisterComm(TorchCommRCCL* comm);
   virtual void registerMemPreHook();
@@ -73,11 +80,11 @@ class CachingAllocatorHook {
   }
 
   inline static std::unique_ptr<CachingAllocatorHookImpl> instance_ = nullptr;
+  // NOLINTNEXTLINE(facebook-hte-std::once_flag)
+  inline static std::once_flag init_flag_;
 };
 
 // Global function to be registered as a hook
-void cachingAllocatorHookFn(
-    const c10::hip::HIPCachingAllocator::TraceEntry& te);
+void cachingAllocatorHookFn(const TraceEntry& te);
 
-} // namespace comms
-} // namespace torch
+} // namespace torch::comms

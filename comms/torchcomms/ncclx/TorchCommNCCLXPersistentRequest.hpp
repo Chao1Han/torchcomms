@@ -5,8 +5,7 @@
 #include <ATen/ATen.h>
 #include <cuda_runtime.h> // @manual=third-party//cuda:cuda-lazy
 
-namespace torch {
-namespace comms {
+namespace torch::comms {
 
 // Forward declaration
 class TorchCommNCCLX;
@@ -17,7 +16,7 @@ class TorchCommNCCLXPersistentRequest : public torch::CustomClassHolder {
       std::shared_ptr<TorchCommNCCLX> comm,
       void* hdl,
       std::optional<cudaStream_t> stream);
-  ~TorchCommNCCLXPersistentRequest();
+  ~TorchCommNCCLXPersistentRequest() noexcept;
 
   // Delete copy and move operations
   TorchCommNCCLXPersistentRequest(const TorchCommNCCLXPersistentRequest&) =
@@ -37,5 +36,4 @@ class TorchCommNCCLXPersistentRequest : public torch::CustomClassHolder {
   std::optional<cudaStream_t> stream_{std::nullopt};
 };
 
-} // namespace comms
-} // namespace torch
+} // namespace torch::comms

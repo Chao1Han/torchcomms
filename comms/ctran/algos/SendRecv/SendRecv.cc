@@ -29,6 +29,8 @@ std::unordered_map<KernelConfig::KernelType, void*> kernelFns = {
      reinterpret_cast<void*>(ncclKernelSendRecv</*UNPACK=*/true>)},
     {KernelConfig::KernelType::SENDRECV_STAGED,
      reinterpret_cast<void*>(ncclKernelSendRecvStaged)},
+    {KernelConfig::KernelType::SENDRECV_P2P,
+     reinterpret_cast<void*>(ncclKernelSendRecvP2p)},
 };
 
 static const auto myAlgo = NCCL_SENDRECV_ALGO::ctran;
@@ -138,7 +140,7 @@ commResult_t ctranGroupEndHook(
           // - If the buffer is not yet registered at regAsync internal query, a
           //   request will be enqueued to asyncReg thread.
           // - A first-used buffer will be registered either by asyncReg thread
-          //   or GPE thread (see MemRegCache::regRange).
+          //   or GPE thread (see RegCache::regRange).
           // - regAsync is a no-op if NCCL_CTRAN_REGISTER is not async mode.
           //
           // Expected performance improvement for communication involving

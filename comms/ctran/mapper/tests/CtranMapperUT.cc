@@ -7,7 +7,8 @@
 #include <memory>
 
 #include "comms/ctran/mapper/CtranMapper.h"
-#include "comms/ctran/mapper/CtranMapperImpl.h"
+#include "comms/ctran/regcache/IpcRegCache.h"
+#include "comms/ctran/regcache/IpcRegCacheBase.h"
 #include "comms/ctran/regcache/RegCache.h"
 #include "comms/ctran/tests/CtranTestUtils.h"
 #include "comms/testinfra/TestXPlatUtils.h"
@@ -27,9 +28,10 @@ class CtranMapperTest : public ::testing::Test {
   std::shared_ptr<ctran::RegCache> regCache{nullptr};
 
  protected:
+  SysEnvRAII topoEnv_{"NCCL_IGNORE_TOPO_LOAD_FAILURE", "true"};
+
   void SetUp() override {
     ncclCvarInit();
-    setenv("NCCL_IGNORE_TOPO_LOAD_FAILURE", "true", 1);
 
     ctran::logGpuMemoryStats(cudaDev);
 
@@ -59,7 +61,7 @@ class CtranMapperTest : public ::testing::Test {
   }
 };
 TEST(CtranMapperUT, EnableBackendThroughCVARs) {
-  setenv("NCCL_CTRAN_BACKENDS", "ib, nvl, socket", 1);
+  SysEnvRAII backendsEnv("NCCL_CTRAN_BACKENDS", "ib, nvl, socket");
   ncclCvarInit();
   auto commRAII = ctran::createDummyCtranComm();
   auto dummyComm = commRAII->ctranComm.get();
@@ -72,7 +74,7 @@ TEST(CtranMapperUT, EnableBackendThroughCVARs) {
 }
 
 TEST(CtranMapperUT, EnableBackendThroughCVARsWithoutIB) {
-  setenv("NCCL_CTRAN_BACKENDS", "nvl, socket", 1);
+  SysEnvRAII backendsEnv("NCCL_CTRAN_BACKENDS", "nvl, socket");
   ncclCvarInit();
   auto commRAII = ctran::createDummyCtranComm();
   auto dummyComm = commRAII->ctranComm.get();
@@ -85,7 +87,7 @@ TEST(CtranMapperUT, EnableBackendThroughCVARsWithoutIB) {
 TEST(CtranMapperUT, EnableBackendWithConfigUnset) {
   // Test that when config_.backends contains only UNSET, mapper falls back
   // to using NCCL_CTRAN_BACKENDS CVAR.
-  setenv("NCCL_CTRAN_BACKENDS", "nvl, socket", 1);
+  SysEnvRAII backendsEnv("NCCL_CTRAN_BACKENDS", "nvl, socket");
   ncclCvarInit();
   auto commRAII = ctran::createDummyCtranComm();
   auto dummyComm = commRAII->ctranComm.get();
@@ -100,7 +102,7 @@ TEST(CtranMapperUT, EnableBackendWithConfigUnset) {
 TEST(CtranMapperUT, EnableBackendWithExplicitConfigOverride) {
   // Test that when config_.backends is explicitly set,
   // it overrides the NCCL_CTRAN_BACKENDS CVAR.
-  setenv("NCCL_CTRAN_BACKENDS", "nvl, socket", 1);
+  SysEnvRAII backendsEnv("NCCL_CTRAN_BACKENDS", "nvl, socket");
   ncclCvarInit();
   auto commRAII = ctran::createDummyCtranComm();
   auto dummyComm = commRAII->ctranComm.get();
@@ -115,13 +117,11 @@ TEST(CtranMapperUT, EnableBackendWithExplicitConfigOverride) {
 }
 
 TEST(CtranMapperUT, EnableBackendThroughCVARsWithTCPandIB) {
-  setenv("NCCL_CTRAN_BACKENDS", "nvl, ib, socket, tcpdm", 1);
+  SysEnvRAII backendsEnv("NCCL_CTRAN_BACKENDS", "nvl, ib, socket, tcpdm");
   ncclCvarInit();
   std::optional<std::exception> ex;
   try {
     ctran::createDummyCtranComm();
-  } catch (const std::runtime_error& e) {
-    ex = e;
   } catch (const ctran::utils::Exception& e) {
     ex = e;
   }
@@ -234,6 +234,39 @@ TEST_F(CtranMapperTest, regHostMemLazy) {
   EXPECT_EQ(snapshot.totalNumReg, 1);
   EXPECT_EQ(snapshot.totalNumDereg, 1);
   EXPECT_EQ(snapshot.totalNumDynamicReg, 0);
+}
+
+TEST_F(CtranMapperTest, segmentBufReturnsOriginalAddr) {
+  EnvRAII env(NCCL_CTRAN_REGISTER, NCCL_CTRAN_REGISTER::lazy);
+
+  mapper = std::make_unique<CtranMapper>(dummyComm_);
+  EXPECT_THAT(mapper, testing::NotNull());
+
+  auto res = mapper->regMem(buf, bufSize, &hdl, false);
+  EXPECT_EQ(res, commSuccess);
+  EXPECT_THAT(hdl, testing::NotNull());
+
+  EXPECT_EQ(mapper->segmentBuf(hdl), buf);
+
+  EXPECT_EQ(mapper->deregMem(hdl), commSuccess);
+}
+
+TEST_F(CtranMapperTest, segmentBufReturnsOriginalAddrHostMem) {
+  EnvRAII env(NCCL_CTRAN_REGISTER, NCCL_CTRAN_REGISTER::lazy);
+
+  mapper = std::make_unique<CtranMapper>(dummyComm_);
+  EXPECT_THAT(mapper, testing::NotNull());
+
+  void* bufH = malloc(bufSize);
+  void* segHdl = nullptr;
+  auto res = mapper->regMem(bufH, bufSize, &segHdl, false);
+  EXPECT_EQ(res, commSuccess);
+  EXPECT_THAT(segHdl, testing::NotNull());
+
+  EXPECT_EQ(mapper->segmentBuf(segHdl), bufH);
+
+  EXPECT_EQ(mapper->deregMem(segHdl), commSuccess);
+  free(bufH);
 }
 
 TEST_F(CtranMapperTest, deregMem) {
@@ -1175,7 +1208,7 @@ TEST_F(CtranMapperTest, RemoteAccessKeyToString) {
     rkey1.ibKey.rkeys[i] = 291 + i;
   }
   rkey1.ibKey.nKeys = CTRAN_MAX_IB_DEVICES_PER_RANK;
-  rkey1.nvlKey.peerRank = 1;
+  rkey1.nvlKey.peerId = "host1:1234";
   rkey1.nvlKey.basePtr = (void*)0x4567890;
   EXPECT_EQ(rkey1.toString(), "backend=IB, ibKey=[291, 292]");
 
@@ -1183,42 +1216,42 @@ TEST_F(CtranMapperTest, RemoteAccessKeyToString) {
   rkey2.backend = CtranMapperBackend::NVL;
   EXPECT_EQ(
       rkey2.toString(),
-      "backend=NVL, nvlKey=[peerRank: 1, basePtr: 0x4567890]");
+      "backend=NVL, nvlKey=[peerId: host1:1234, basePtr: 0x4567890, uid: 0]");
 
   CtranMapperRemoteAccessKey rkey3 = rkey1;
   rkey3.backend = CtranMapperBackend::UNSET;
   EXPECT_EQ(rkey3.toString(), "backend=UNKNOWN");
 }
 
-TEST_F(CtranMapperTest, ExportRegCache) {
-  std::unique_ptr<ctran::ExportRegCache> cache =
-      std::make_unique<ctran::ExportRegCache>();
-  const ctran::regcache::RegElem* dummyRegElem0 =
-      reinterpret_cast<ctran::regcache::RegElem*>(0x12345);
-  const std::vector<int> peers = {0, 1, 2, 3};
+TEST_F(CtranMapperTest, IpcExportCache) {
+  std::unique_ptr<ctran::regcache::IpcExportCache> cache =
+      std::make_unique<ctran::regcache::IpcExportCache>();
+  ctran::regcache::IpcRegElem* dummyRegElem0 =
+      reinterpret_cast<ctran::regcache::IpcRegElem*>(0x12345);
+  const std::vector<std::string> peers = {"peer0", "peer1", "peer2", "peer3"};
 
-  for (auto peer : peers) {
+  for (const auto& peer : peers) {
     cache->record(dummyRegElem0, peer);
   }
 
-  // Except dump gives full copy of the cache
+  // Expect dump gives full copy of the cache
   const auto dump = cache->dump();
   EXPECT_EQ(dump.size(), 1);
   auto it = dump.begin();
   EXPECT_EQ(it->first, dummyRegElem0);
   EXPECT_EQ(it->second.size(), peers.size());
 
-  const ctran::regcache::RegElem* dummyRegElem1 =
-      reinterpret_cast<ctran::regcache::RegElem*>(0x12346);
+  ctran::regcache::IpcRegElem* dummyRegElem1 =
+      reinterpret_cast<ctran::regcache::IpcRegElem*>(0x12346);
 
-  // Expect return empty vector for non-existing regElem
+  // Expect return empty set for non-existing regElem
   auto cachedPeers = cache->remove(dummyRegElem1);
   EXPECT_EQ(cachedPeers.size(), 0);
 
   // Expect return cached peers for existing regElem
   cachedPeers = cache->remove(dummyRegElem0);
   EXPECT_EQ(cachedPeers.size(), peers.size());
-  for (auto peer : peers) {
+  for (const auto& peer : peers) {
     EXPECT_EQ(cachedPeers.count(peer), 1);
   }
 
@@ -1250,10 +1283,11 @@ class CtranMapperTestDisjoint : public ::testing::Test {
   bool usedDisjointAllocation = false;
 
  protected:
+  SysEnvRAII ctranEnableEnv_{"NCCL_CTRAN_ENABLE", "1"};
+  SysEnvRAII topoEnv_{"NCCL_IGNORE_TOPO_LOAD_FAILURE", "true"};
+
   void SetUp() override {
-    setenv("NCCL_CTRAN_ENABLE", "1", 0);
     ncclCvarInit();
-    setenv("NCCL_IGNORE_TOPO_LOAD_FAILURE", "true", 1);
 
     ctran::logGpuMemoryStats(cudaDev);
 
@@ -1342,4 +1376,48 @@ TEST_F(CtranMapperTestDisjoint, dynamicReg) {
   EXPECT_EQ(snapshot.totalNumReg, 1);
   EXPECT_EQ(snapshot.totalNumDereg, 1);
   EXPECT_EQ(snapshot.totalNumDynamicReg, 1);
+}
+
+// When NCCL_CTRAN_IPC_REGCACHE_ENABLE_ASYNC_SOCKET is false, the mapper should
+// skip IpcRegCache::init() and allGatherIpcServerAddrs(). NVL backend should
+// still be created (for window-based operations).
+TEST(CtranMapperUT, IpcRegCacheDisabledSkipsSocketInit) {
+  SysEnvRAII ipcEnv("NCCL_CTRAN_IPC_REGCACHE_ENABLE_ASYNC_SOCKET", "0");
+  SysEnvRAII backendsEnv("NCCL_CTRAN_BACKENDS", "ib, nvl, socket");
+  ncclCvarInit();
+  auto commRAII = ctran::createDummyCtranComm();
+  auto dummyComm = commRAII->ctranComm.get();
+  auto mapper = std::make_unique<CtranMapper>(dummyComm);
+  auto rank = dummyComm->statex_->rank();
+
+  // NVL backend should still be available (for window operations)
+  EXPECT_TRUE(mapper->hasBackend(rank, CtranMapperBackend::NVL));
+
+  // IpcRegCache singleton peer address map should be empty since
+  // allGatherIpcServerAddrs() was skipped
+  auto ipcRegCache = ctran::IpcRegCache::getInstance();
+  folly::SocketAddress addr;
+  auto peerId = dummyComm->statex_->gPid(rank);
+  EXPECT_EQ(
+      ipcRegCache->getPeerIpcServerAddr(peerId, addr), commInvalidArgument);
+}
+
+// When NCCL_CTRAN_IPC_REGCACHE_ENABLE_ASYNC_SOCKET is true (default), the
+// mapper initializes IpcRegCache and populates the peer address map.
+TEST(CtranMapperUT, IpcRegCacheEnabledPopulatesPeerAddrs) {
+  SysEnvRAII ipcEnv("NCCL_CTRAN_IPC_REGCACHE_ENABLE_ASYNC_SOCKET", "1");
+  SysEnvRAII backendsEnv("NCCL_CTRAN_BACKENDS", "ib, nvl, socket");
+  ncclCvarInit();
+  auto commRAII = ctran::createDummyCtranComm();
+  auto dummyComm = commRAII->ctranComm.get();
+  auto mapper = std::make_unique<CtranMapper>(dummyComm);
+  auto rank = dummyComm->statex_->rank();
+
+  // IpcRegCache should have our own peer address populated
+  auto ipcRegCache = ctran::IpcRegCache::getInstance();
+  folly::SocketAddress addr;
+  auto peerId = dummyComm->statex_->gPid(rank);
+  EXPECT_EQ(ipcRegCache->getPeerIpcServerAddr(peerId, addr), commSuccess);
+  // The address should be non-empty (socket server was initialized)
+  EXPECT_NE(addr.getPort(), 0);
 }

@@ -3,12 +3,22 @@
 #pragma once
 
 #include <c10/util/intrusive_ptr.h>
+#include <chrono>
 #include <functional>
 #include <future>
 
-namespace torch {
-namespace comms {
+namespace torch::comms {
 
+/**
+ * TorchWork - Base class representing asynchronous work.
+ *
+ * Thread Safety:
+ * TorchWork is NOT thread-safe. All methods (status(), isCompleted(), wait())
+ * must be called from a single thread. Concurrent calls from multiple threads
+ * are not supported.
+ *
+ * Work objects should not be destroyed while wait() is in progress.
+ */
 class TorchWork : public c10::intrusive_ptr_target {
  public:
   // Status of a work object
@@ -21,7 +31,7 @@ class TorchWork : public c10::intrusive_ptr_target {
   };
 
   TorchWork() = default;
-  virtual ~TorchWork() = default;
+  ~TorchWork() override = default;
 
   WorkStatus status() const {
     return status_.load(std::memory_order_relaxed);
@@ -32,6 +42,13 @@ class TorchWork : public c10::intrusive_ptr_target {
 
   // Pure virtual functions that derived classes must implement
   virtual void wait() = 0;
+
+  // Returns the timeout for this work object.
+  // Derived classes with timeout support should override this.
+  // Returns max() by default for work types that don't support timeout.
+  virtual std::chrono::milliseconds getTimeout() const {
+    return std::chrono::milliseconds::max();
+  }
 
   // Disable copy and move semantics
   TorchWork(const TorchWork&) = delete;
@@ -50,19 +67,39 @@ class TorchWork : public c10::intrusive_ptr_target {
   }
 
   friend class TorchComm;
+  friend class WorkWrapper;
 
   void setCallback(std::function<void()> callback) {
     callback_ = std::move(callback);
+    auto currentStatus = status();
+    if (currentStatus == WorkStatus::COMPLETED ||
+        currentStatus == WorkStatus::ERROR ||
+        currentStatus == WorkStatus::TIMEDOUT) {
+      runCallback();
+    }
   }
 
   void runCallback() {
     if (callback_) {
+      // NOLINTNEXTLINE(facebook-hte-std::call_once)
       std::call_once(callback_once_, [this]() {
         callback_();
         callback_ = nullptr;
       });
     }
   }
+
+  // break weak-ref cycle: postHook() stores a lambda in callback_ that
+  // captures a weak_intrusive_ptr back to this object. after the strong
+  // refcount reaches 0, release_resources() clears the callback, destroying the
+  // weak pointer and allowing the weak refcount to reach 0 so the object is
+  // deleted.
+  void release_resources() override {
+    callback_ = nullptr;
+  }
+
+  template <typename T, typename NullType>
+  friend class c10::intrusive_ptr;
 
  private:
   std::atomic<WorkStatus> status_{WorkStatus::NOT_STARTED};
@@ -92,5 +129,4 @@ class TorchWorkThread : public TorchWork {
   std::future<void> future_;
 };
 
-} // namespace comms
-} // namespace torch
+} // namespace torch::comms

@@ -10,12 +10,11 @@
 
 #include "comms/torchcomms/TorchCommBackend.hpp"
 #include "comms/torchcomms/TorchCommOptions.hpp"
-#include "comms/torchcomms/device/CudaApi.hpp"
+#include "comms/torchcomms/device/cuda/CudaApi.hpp"
 #include "comms/torchcomms/ncclx/NcclxApi.hpp"
 #include "nccl.h" // @manual=//comms/ncclx:nccl
 
-namespace torch {
-namespace comms {
+namespace torch::comms {
 
 constexpr uint16_t kTCPStorePort = 29500;
 
@@ -27,7 +26,7 @@ class TorchCommNCCLXBootstrap {
       std::shared_ptr<NcclxApi> nccl_api,
       std::shared_ptr<CudaApi> cuda_api,
       std::chrono::milliseconds timeout);
-  ~TorchCommNCCLXBootstrap();
+  ~TorchCommNCCLXBootstrap() noexcept;
 
   // Delete copy and move operations
   TorchCommNCCLXBootstrap(const TorchCommNCCLXBootstrap&) = delete;
@@ -80,5 +79,4 @@ void populateNcclConfigFromHints(
     const CommOptions& options,
     const std::string& name);
 
-} // namespace comms
-} // namespace torch
+} // namespace torch::comms

@@ -2,10 +2,14 @@
 
 #include "RdmaTransport.h"
 
+#include <folly/synchronization/CallOnce.h>
+
+#include <fmt/core.h>
 #include "comms/ctran/backends/ib/CtranIb.h"
 #include "comms/ctran/utils/Checks.h"
 #include "comms/ctran/utils/CudaWrap.h"
 #include "comms/ctran/utils/LogInit.h"
+#include "comms/utils/checks.h"
 
 namespace {
 
@@ -13,9 +17,10 @@ constexpr std::chrono::microseconds kProgressInterval{0};
 constexpr int kDummyRank = 0;
 constexpr int kDummyDevice = 0;
 
-std::once_flag initOnceFlag;
+// NOLINTNEXTLINE(facebook-avoid-non-const-global-variables)
+folly::once_flag initOnceFlag;
 void initEnvironment() {
-  std::call_once(initOnceFlag, [] {
+  folly::call_once(initOnceFlag, [] {
     ncclCvarInit();
     ctran::logging::initCtranLogging();
     ctran::utils::commCudaLibraryInit();
@@ -39,13 +44,18 @@ RdmaMemory::RdmaMemory(RdmaMemory&& other) noexcept
       cudaDev_(other.cudaDev_),
       regHdl_(other.regHdl_),
       remoteKey_(std::move(other.remoteKey_)) {
+  // Properly invalidate the moved-from object to prevent double-free
+  // and ensure the object is in a valid but unspecified state
+  other.buf_ = nullptr;
+  other.len_ = 0;
+  other.cudaDev_ = -1;
   other.regHdl_ = nullptr;
-  other.remoteKey_.clear();
+  // Note: remoteKey_ is already moved, leaving other.remoteKey_ empty
 }
 
-RdmaMemory::~RdmaMemory() {
+RdmaMemory::~RdmaMemory() noexcept {
   if (remoteKey_.size() > 0 && regHdl_) {
-    FB_COMMCHECKTHROW(CtranIb::deregMem(regHdl_));
+    FB_COMMCHECKIGNORE(CtranIb::deregMem(regHdl_));
   }
 }
 
@@ -58,6 +68,14 @@ struct RdmaTransport::Work {
   Type type{Type::Write};
   CtranIbRequest ibReq;
   folly::Promise<commResult_t> promise;
+
+  // Mock context for this work (type from setMockForTest)
+  RdmaTransport::MockContext mockContext;
+
+  // Timeout tracking for write operations (production and mock)
+  std::optional<std::chrono::milliseconds> timeout;
+  // Only valid and set when timeout is set.
+  std::chrono::steady_clock::time_point creationTime;
 };
 
 RdmaTransport::RdmaTransport(int cudaDev, folly::EventBase* evb)
@@ -81,13 +99,37 @@ RdmaTransport::RdmaTransport(int cudaDev, folly::EventBase* evb)
   }
 }
 
-RdmaTransport::~RdmaTransport() {}
+RdmaTransport::~RdmaTransport() {
+  // Run cleanup on the EventBase thread to safely cancel the timeout
+  // and prevent progress() from racing with destruction.
+  if (evb_) {
+    evb_->runImmediatelyOrRunInEventBaseThreadAndWait([this]() {
+      if (progressTimeout_) {
+        progressTimeout_->cancelTimeout();
+      }
+      auto pendingWorks = pendingWorks_.wlock();
+      auto numPending = pendingWorks->size();
+      if (numPending > 0) {
+        XLOGF(
+            WARN,
+            "~RdmaTransport: draining {} pending works with commUserAbort",
+            numPending);
+      }
+      for (auto it = pendingWorks->begin(); it != pendingWorks->end();) {
+        (*it)->promise.setValue(commUserAbort);
+        it = pendingWorks->erase(it);
+      }
+    });
+  }
+}
 
 namespace {
-std::once_flag queryRdmaSupportOnceFlag;
+// NOLINTNEXTLINE(facebook-avoid-non-const-global-variables)
+folly::once_flag queryRdmaSupportOnceFlag;
+// NOLINTNEXTLINE(facebook-avoid-non-const-global-variables)
 bool rdmaSupport = false;
 bool queryRdmaSupport() {
-  std::call_once(queryRdmaSupportOnceFlag, [] {
+  folly::call_once(queryRdmaSupportOnceFlag, [] {
     XLOG(INFO) << "Querying RdmaTransport support";
     try {
       auto ib = std::make_unique<CtranIb>(
@@ -133,36 +175,59 @@ bool RdmaTransport::connected() const {
 folly::SemiFuture<commResult_t> RdmaTransport::write(
     RdmaMemory::View localBuffer,
     const RdmaRemoteBuffer& remoteBuffer,
-    bool notify) {
-  CHECK_THROW(connected(), std::runtime_error);
+    bool notify,
+    std::optional<std::chrono::milliseconds> timeout) {
+  auto currentMockType = mockContext_.rlock()->type;
+
+  // Skip connected check when mock is enabled for testing
+  if (currentMockType == MockType::None) {
+    CHECK_THROW(connected(), std::runtime_error);
+  }
   CHECK_THROW(evb_, std::runtime_error);
   CHECK_THROW(localBuffer.size() <= remoteBuffer.len, std::runtime_error);
 
-  CHECK(cudaDev_ == localBuffer->getDevice());
+  CHECK_EQ(cudaDev_, localBuffer->getDevice());
 
-  auto ibRemoteKey = CtranIbRemoteAccessKey::fromString(remoteBuffer.accessKey);
   auto work = std::make_unique<Work>();
   work->type = Work::Type::Write;
+  work->mockContext.type = currentMockType;
   auto sf = work->promise.getSemiFuture();
 
-  CtranIbEpochRAII epochRAII(ib_.get());
-  FB_COMMCHECK(ib_->iput(
-      localBuffer.data(),
-      remoteBuffer.ptr,
-      localBuffer.size(),
-      kDummyRank,
-      localBuffer->localKey(),
-      ibRemoteKey,
-      notify,
-      nullptr,
-      &work->ibReq,
-      false));
+  if (currentMockType == MockType::None) {
+    // Production path - perform actual IB operations
+    auto ibRemoteKey =
+        CtranIbRemoteAccessKey::fromString(remoteBuffer.accessKey);
+    CtranIbEpochRAII epochRAII(ib_.get());
+    FB_COMMCHECK(ib_->iput(
+        localBuffer.data(),
+        remoteBuffer.ptr,
+        localBuffer.size(),
+        kDummyRank,
+        localBuffer->localKey(),
+        ibRemoteKey,
+        notify,
+        nullptr,
+        &work->ibReq,
+        false));
+    // Capture timeout for production write timeout
+    if (timeout.has_value()) {
+      work->timeout = timeout;
+      work->creationTime = std::chrono::steady_clock::now();
+    }
+  } else if (currentMockType == MockType::Timeout) {
+    // Mock timeout path - capture timeout if provided
+    if (timeout.has_value()) {
+      work->timeout = timeout;
+      work->creationTime = std::chrono::steady_clock::now();
+    }
+  }
 
   // Add work to pending list and schedule progress
   auto pendingWorks = pendingWorks_.wlock();
   pendingWorks->emplace_back(std::move(work));
   evb_->runInEventBaseThread([this]() { progress(); });
 
+  // NOLINTNEXTLINE(clang-diagnostic-nrvo)
   return sf;
 }
 
@@ -188,13 +253,13 @@ folly::SemiFuture<commResult_t> RdmaTransport::read(
   CHECK_THROW(connected(), std::runtime_error);
   CHECK_THROW(evb_, std::runtime_error);
 
-  CHECK(cudaDev_ == localBuffer->getDevice());
+  CHECK_EQ(cudaDev_, localBuffer->getDevice());
 
-  auto ibRemoteKey = CtranIbRemoteAccessKey::fromString(remoteBuffer.accessKey);
   auto work = std::make_unique<Work>();
   work->type = Work::Type::Read;
   auto sf = work->promise.getSemiFuture();
 
+  auto ibRemoteKey = CtranIbRemoteAccessKey::fromString(remoteBuffer.accessKey);
   CtranIbEpochRAII epochRAII(ib_.get());
   FB_COMMCHECK(ib_->iget(
       remoteBuffer.ptr,
@@ -212,6 +277,7 @@ folly::SemiFuture<commResult_t> RdmaTransport::read(
   pendingWorks->emplace_back(std::move(work));
   evb_->runInEventBaseThread([this]() { progress(); });
 
+  // NOLINTNEXTLINE(clang-diagnostic-nrvo)
   return sf;
 }
 
@@ -226,17 +292,52 @@ void RdmaTransport::progress() {
 
   auto pendingWorks = pendingWorks_.wlock();
   for (auto it = pendingWorks->begin(); it != pendingWorks->end();) {
+    // Mock failure always takes precedence — return commInternalError
+    // regardless of IB state
+    auto& work = *it;
+    if (work->mockContext.type == MockType::Failure) {
+      work->promise.setValue(commInternalError);
+      it = pendingWorks->erase(it);
+      continue;
+    }
+
+    // Mock timeout: no IB operation was issued, so skip IB checks.
+    // Only check the timeout parameter (if any); otherwise keep waiting.
+    if (work->mockContext.type == MockType::Timeout) {
+      if (work->timeout.has_value()) {
+        auto elapsed = std::chrono::steady_clock::now() - work->creationTime;
+        if (elapsed >= work->timeout.value()) {
+          work->promise.setValue(commTimeout);
+          it = pendingWorks->erase(it);
+          continue;
+        }
+      }
+      ++it;
+      continue;
+    }
+
     if (hasError) {
       (*it)->promise.setValue(res);
       it = pendingWorks->erase(it);
       continue;
     }
 
+    // Check IB completion
     if (((*it)->type == Work::Type::Write || (*it)->type == Work::Type::Read) &&
         (*it)->ibReq.isComplete()) {
-      (*it)->promise.setValue(hasError ? res : commSuccess);
+      (*it)->promise.setValue(commSuccess);
       it = pendingWorks->erase(it);
       continue;
+    }
+
+    // Check write timeout (production path only — mock timeout handled above)
+    if ((*it)->type == Work::Type::Write && (*it)->timeout.has_value()) {
+      auto elapsed = std::chrono::steady_clock::now() - (*it)->creationTime;
+      if (elapsed >= (*it)->timeout.value()) {
+        (*it)->promise.setValue(commTimeout);
+        it = pendingWorks->erase(it);
+        continue;
+      }
     }
 
     if ((*it)->type == Work::Type::WaitForWrite) {
@@ -257,6 +358,16 @@ void RdmaTransport::progress() {
   if (pendingWorks->size()) {
     progressTimeout_->scheduleTimeoutHighRes(kProgressInterval);
   }
+}
+
+void RdmaTransport::setMockForTest(MockContext context) {
+  *mockContext_.wlock() = context;
+}
+
+// Deprecated no-op: cleanup is handled by the destructor.
+// TODO: Remove after upper layer removes calling abort().
+void RdmaTransport::abort() {
+  XLOG(DBG) << "abort() called (no-op, cleanup deferred to destructor)";
 }
 
 } // namespace torch::comms

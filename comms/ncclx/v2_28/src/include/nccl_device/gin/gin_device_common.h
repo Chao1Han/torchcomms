@@ -45,7 +45,7 @@ struct ncclGinDescriptorSmem {
   alignas(16) char space[64];
 };
 
-#if __CUDACC__
+#if NCCL_CHECK_CUDACC
 template <ncclNetDeviceType backend>
 struct ncclGinApi_Put {
   template <typename Coop>
@@ -66,6 +66,15 @@ struct ncclGinApi_PutValue {
                                       size_t dstOff, T srcData, bool hasSignal,
                                       ncclGinSignal_t signalId, ncclGinSignalOp_t signalOp,
                                       uint64_t signalOpArg, bool hasDescriptor,
+                                      ncclGinDescriptorSmem* descriptor,
+                                      cuda::thread_scope required, cuda::thread_scope given);
+};
+
+template <ncclNetDeviceType backend>
+struct ncclGinApi_AtomicAdd {
+  template <typename Coop>
+  NCCL_DEVICE_INLINE static void call(ncclGinCtx, Coop coop, int peer, ncclGinWindow_t dstWin,
+                                      size_t dstOff, uint64_t value, bool hasDescriptor,
                                       ncclGinDescriptorSmem* descriptor,
                                       cuda::thread_scope required, cuda::thread_scope given);
 };
@@ -96,7 +105,7 @@ struct ncclGinApi_Flush {
 };
 #endif
 
-#if __CUDACC__
+#if NCCL_CHECK_CUDACC
 template <template <ncclNetDeviceType> typename ApiFn, unsigned beMask, typename... Arg>
 NCCL_DEVICE_INLINE static decltype(auto) ncclGinCall(ncclGinCtx_M<beMask> ctx, Arg&&... arg) {
   bool singleton = (beMask & (beMask - 1)) == 0;  // Only one bit set

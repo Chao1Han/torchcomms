@@ -5,16 +5,15 @@
 #include <gmock/gmock.h>
 #include "comms/torchcomms/ncclx/TorchCommNCCLXCCA.hpp"
 
-namespace torch {
-namespace comms {
-namespace test {
+namespace torch::comms::test {
 
 /**
  * Mock implementation of CachingAllocatorHookImpl using Google Mock.
  * This class provides mock implementations of all CachingAllocatorHookImpl
  * operations for testing purposes.
+ * Note: Inherits from base interface to avoid CUDA initialization in Default.
  */
-class CachingAllocatorHookMock : public DefaultCachingAllocatorHookImpl {
+class CachingAllocatorHookMock : public CachingAllocatorHookImpl {
  public:
   CachingAllocatorHookMock() = default;
   virtual ~CachingAllocatorHookMock() override = default;
@@ -26,6 +25,7 @@ class CachingAllocatorHookMock : public DefaultCachingAllocatorHookImpl {
       (override));
   MOCK_METHOD(void, registerComm, (TorchCommNCCLX * comm), (override));
   MOCK_METHOD(void, deregisterComm, (TorchCommNCCLX * comm), (override));
+  MOCK_METHOD(void, registerMemPreHook, (), (override));
   MOCK_METHOD(void, clear, (), (override));
 
   /**
@@ -46,10 +46,15 @@ class CachingAllocatorHookMock : public DefaultCachingAllocatorHookImpl {
    */
   bool isCommRegistered(TorchCommNCCLX* comm) override;
 
+  /**
+   * Check if registerMemPreHook was called.
+   * @return true if registerMemPreHook was called, false otherwise
+   */
+  bool isMemRegisteredCalled();
+
  private:
   std::set<TorchCommNCCLX*> registered_comms_;
+  bool mem_pre_hook_registered_ = false;
 };
 
-} // namespace test
-} // namespace comms
-} // namespace torch
+} // namespace torch::comms::test
